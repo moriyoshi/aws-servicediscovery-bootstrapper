@@ -92,6 +92,20 @@ If specified, `instances` function will not fail if no instances that match the 
 The arguments to pass to the executable. These can include interpolated values from CloudMap services. How the interpolation works is described below.
 </dl>
 
+### `env` emulation
+
+If the first token of the command is literally `env`, the bootstrapper emulates the `env` utility: any leading `NAME=VALUE` operands are consumed and set as environment variables on the executable that follows. The first operand that is not of the form `NAME=VALUE` begins the actual command.
+
+```bash
+aws-service-discovery-bootstrapper \
+  -namespace <namespace> \
+  -- env SERVERS='{{ join "," (extract "IPv4Addr" (instances "my-service")) }}' <executable> [args...]
+```
+
+The `VALUE` part is interpolated with the same functions available for arguments (see [Interpolation](#interpolation) below), so computed values can be passed as environment variables. Because the variables are handed directly to the process rather than through a shell, discovered values are safe even if they contain shell metacharacters.
+
+Only the `NAME=VALUE` form is supported. `env` options (such as `-i`, `-u`, `-C`, or `-S`) are **not** supported; an operand starting with `-` is treated as the command to run and will fail as "command not found". Assignments are applied in order and override any inherited variable of the same name.
+
 ## Interpolation
 
 The AWS ServiceDiscovery bootstrapper uses the [go-template](https://golang.org/pkg/text/template/) syntax for interpolation. The following functions are available:
