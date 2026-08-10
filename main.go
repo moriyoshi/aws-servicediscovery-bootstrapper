@@ -246,6 +246,24 @@ func getActualValueOf(rv reflect.Value) reflect.Value {
 	return rv
 }
 
+// isValidEnvName reports whether s is a valid environment variable name
+// ([A-Za-z_][A-Za-z0-9_]*), used to distinguish env NAME=VALUE operands from the
+// command to run.
+func isValidEnvName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, c := range s {
+		switch {
+		case c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'):
+		case i > 0 && c >= '0' && c <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func doIt(ctx context.Context, logger *slog.Logger) error {
 	if namespace == "" {
 		return fmt.Errorf("namespace is required")
@@ -273,6 +291,35 @@ func doIt(ctx context.Context, logger *slog.Logger) error {
 	if len(cmdLine) < 1 {
 		return fmt.Errorf("command is required")
 	}
+
+	// env utility emulation: if the first token is literally "env", consume the
+	// leading NAME=VALUE operands and set them as environment variables on the
+	// command being run. Only the NAME=VALUE form is supported (no options). The
+	// VALUE part is interpolated with the same template functions as the argv.
+	type envAssignment struct {
+		name      string
+		valueTmpl string
+	}
+	var envAssignments []envAssignment
+	if cmdLine[0] == "env" {
+		i := 1
+		for ; i < len(cmdLine); i++ {
+			arg := cmdLine[i]
+			eq := strings.IndexByte(arg, '=')
+			if eq <= 0 || !isValidEnvName(arg[:eq]) {
+				break
+			}
+			envAssignments = append(envAssignments, envAssignment{
+				name:      arg[:eq],
+				valueTmpl: arg[eq+1:],
+			})
+		}
+		cmdLine = cmdLine[i:]
+		if len(cmdLine) < 1 {
+			return fmt.Errorf("command is required")
+		}
+	}
+
 	var err error
 	cmdLine[0], err = exec.LookPath(cmdLine[0])
 	if err != nil {
@@ -477,6 +524,15 @@ func doIt(ctx context.Context, logger *slog.Logger) error {
 		cmdLineT[i] = t
 	}
 
+	envValueT := make([]*template.Template, len(envAssignments))
+	for i, a := range envAssignments {
+		t, err := template.New("env" + strconv.Itoa(i)).Funcs(funcMap).Parse(a.valueTmpl)
+		if err != nil {
+			return fmt.Errorf("failed to parse env value for %s: %w", a.name, err)
+		}
+		envValueT[i] = t
+	}
+
 	if preconditionFunc != nil {
 		logger.Info("checking precondition", slog.String("precondition", precondition))
 		preconditionFunc(ctx, &cfg, 3*time.Second, preconditionCheckTimeout)
@@ -500,9 +556,20 @@ func doIt(ctx context.Context, logger *slog.Logger) error {
 		renderedCmdLine[i+1] = buf.String()
 	}
 
-	logger.Info("running", slog.Any("argv", renderedCmdLine))
+	extraEnv := make([]string, len(envValueT))
+	envNames := make([]string, len(envValueT))
+	for i, t := range envValueT {
+		var buf bytes.Buffer
+		if err := t.Execute(&buf, nil); err != nil {
+			return fmt.Errorf("failed to execute env template for %s: %w", envAssignments[i].name, err)
+		}
+		extraEnv[i] = envAssignments[i].name + "=" + buf.String()
+		envNames[i] = envAssignments[i].name
+	}
+
+	logger.Info("running", slog.Any("argv", renderedCmdLine), slog.Any("env", envNames))
 	cmd := exec.CommandContext(ctx, renderedCmdLine[0], renderedCmdLine[1:]...)
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), extraEnv...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
