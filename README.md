@@ -29,6 +29,9 @@ aws-service-discovery-bootstrapper \
   -execution-delay-jitter <delay> \
   -execution-delay-jitter-unit <unit> \
   [-no-fail] \
+  [-respawn [-respawn-keep-alive] [-respawn-max-retries <n>] ...] \
+  [-healthcheck-type <http|https|tcp|grpc> -healthcheck-target <target> ...] \
+  [-control-socket <path>] \
   -- <executable> [args...]
 ```
 
@@ -80,6 +83,81 @@ The unit of the execution delay jitter. Some of valid values are `1s` (seconds),
 <dd>
 
 If specified, `instances` function will not fail if no instances that match the specified health status are found. Note that retries will still be attempted if this option is specified.
+</dd>
+<dt><code>-respawn</code></dt>
+<dd>
+
+Restart the workload when it exits with a **non-zero** status, up to `-respawn-max-retries` times, with exponential backoff between restarts. A clean exit (status `0`) ends the harness successfully unless `-respawn-keep-alive` is also given. This lets the container survive transient workload failures. Default is off. See [Respawning](#respawning).
+</dd>
+<dt><code>-respawn-keep-alive</code></dt>
+<dd>
+
+Also restart the workload when it exits cleanly (status `0`), i.e. keep it alive regardless of exit status. Implies `-respawn` semantics for exit code `0`. Default is off.
+</dd>
+<dt><code>-respawn-max-retries</code></dt>
+<dd>
+
+Maximum number of **consecutive** restarts before the harness gives up and exits non-zero. `0` means unlimited. The counter is reset once the workload has stayed up for at least `-respawn-reset-after` (see below). Default is `5`.
+</dd>
+<dt><code>-respawn-initial-interval</code> / <code>-respawn-max-interval</code> / <code>-respawn-multiplier</code></dt>
+<dd>
+
+The exponential-backoff parameters used between restarts: the first interval, the ceiling, and the multiplier. Defaults are `1s`, `60s`, and `2.0`. Backoff is jittered.
+</dd>
+<dt><code>-respawn-reset-after</code></dt>
+<dd>
+
+If the workload stays up at least this long, the retry counter and backoff are reset (min-healthy time). This prevents a workload that runs fine for a while and then crashes from eventually exhausting its retries. Default is `30s`.
+</dd>
+<dt><code>-shutdown-grace</code></dt>
+<dd>
+
+Grace period between `SIGTERM` and `SIGKILL` when terminating the workload (on harness shutdown or a health-triggered restart). When the harness receives `SIGTERM`/`SIGINT`, it relays `SIGTERM` to the workload and waits up to this long before force-killing. Default is `10s`.
+</dd>
+<dt><code>-healthcheck-type</code></dt>
+<dd>
+
+Enable a background workload healthcheck of the given type: `http`, `https`, `tcp`, or `grpc`. Empty (the default) disables healthchecking. See [Healthcheck](#healthcheck).
+</dd>
+<dt><code>-healthcheck-target</code></dt>
+<dd>
+
+The probe target. For `http`/`https` it is a URL (a `2xx` response is healthy). For `tcp` it is `host:port` (a successful connection is healthy). For `grpc` it is `host:port` of a server implementing the standard [gRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) (a `SERVING` status is healthy). gRPC is probed over plaintext HTTP/2 (h2c).
+</dd>
+<dt><code>-healthcheck-interval</code> / <code>-healthcheck-timeout</code></dt>
+<dd>
+
+Interval between probes and the per-probe timeout. The timeout must be positive and less than the interval. Defaults are `10s` and `2s`.
+</dd>
+<dt><code>-healthcheck-healthy-threshold</code> / <code>-healthcheck-unhealthy-threshold</code></dt>
+<dd>
+
+The number of consecutive successful / failed probes required to transition to `healthy` / `unhealthy`. Defaults are `1` and `3`.
+</dd>
+<dt><code>-healthcheck-start-period</code></dt>
+<dd>
+
+A grace period before the first probe during which probe failures are ignored (they do not count toward the unhealthy threshold), giving the workload time to start. Default is `0`.
+</dd>
+<dt><code>-healthcheck-action</code></dt>
+<dd>
+
+What to do when the workload becomes `unhealthy`: `none` (default, observational — the state is only exposed via the control socket) or `restart` (kill and respawn the workload; requires `-healthcheck-type` and is subject to the respawn retry/backoff settings).
+</dd>
+<dt><code>-healthcheck-grpc-service</code></dt>
+<dd>
+
+The service name passed in the gRPC `HealthCheckRequest`. Empty (the default) queries overall server health.
+</dd>
+<dt><code>-control-socket</code></dt>
+<dd>
+
+Path to a unix-domain socket on which the harness serves `GET /health` (JSON). Exposes harness-level state (uptime, respawn count, current backoff) and the workload health. Empty (the default) disables it. See [Control socket and health probe](#control-socket-and-health-probe).
+</dd>
+<dt><code>-health-probe</code></dt>
+<dd>
+
+Run the binary as a **health-probe client** instead of the harness: it connects to `-control-socket`, and exits `0` when healthy or non-zero otherwise. Intended for use as a container `HEALTHCHECK CMD`. See [Control socket and health probe](#control-socket-and-health-probe).
 </dd>
 <dt><code>&lt;executable&gt;</code></dt>
 <dd>
@@ -135,6 +213,60 @@ The AWS ServiceDiscovery bootstrapper uses the [go-template](https://golang.org/
 - `ifaddr <CIDR>`: Returns the address that matches the CIDR if exists.
 
     Example: `ifaddr 192.168.0.0/24` will return the IPv4 address of the instance that matches the CIDR.
+
+## Respawning
+
+By default the bootstrapper runs the workload once and exits with its status. With `-respawn`, it instead supervises the workload and restarts it on failure, so the container can survive transient failures:
+
+- A **non-zero** exit triggers a restart (up to `-respawn-max-retries`, with exponential backoff). Add `-respawn-keep-alive` to also restart on a clean exit.
+- The retry counter and backoff reset once the workload has been up for at least `-respawn-reset-after`, so a long-lived workload that eventually crashes is not penalised by earlier restarts.
+- When the retries are exhausted, the harness exits non-zero.
+- The harness is termination-signal aware: on `SIGTERM`/`SIGINT` it relays `SIGTERM` to the workload, waits up to `-shutdown-grace`, then `SIGKILL`s it. Such a shutdown is not counted as a failure and does not trigger a respawn.
+
+```bash
+aws-service-discovery-bootstrapper \
+  -namespace <namespace> \
+  -respawn -respawn-max-retries 10 -respawn-initial-interval 1s -respawn-max-interval 60s \
+  -- <executable> [args...]
+```
+
+## Healthcheck
+
+With `-healthcheck-type`, a background goroutine probes the workload on an interval and tracks a tri-state health (`unknown` → `healthy` / `unhealthy`) using consecutive-success/failure thresholds and an optional start period:
+
+- `http` / `https`: an HTTP `GET` of `-healthcheck-target`; a `2xx` response is healthy.
+- `tcp`: a TCP connection to `host:port`; a successful connect is healthy.
+- `grpc`: the standard [gRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) `Check` over plaintext HTTP/2 (h2c); a `SERVING` status is healthy. Use `-healthcheck-grpc-service` to query a specific service.
+
+The healthcheck is **observational** by default — the state is exposed via the control socket. Set `-healthcheck-action=restart` to have a sustained-unhealthy workload killed and respawned (subject to the respawn settings above).
+
+## Control socket and health probe
+
+With `-control-socket <path>`, the harness serves `GET /health` (JSON) over a unix-domain socket, reporting both harness-level state and workload health:
+
+```json
+{
+  "harness":  { "running": true, "started_at": "…", "uptime_seconds": 123.4 },
+  "workload": { "up": true, "pid": 4321, "started_at": "…", "uptime_seconds": 100.2,
+                "respawn_count": 2, "current_backoff_seconds": 0, "max_retries": 5,
+                "last_exit_code": 0, "last_exit_error": "" },
+  "health":   { "state": "healthy", "consecutive_ok": 3, "consecutive_fail": 0,
+                "last_probe_at": "…", "last_probe_error": "" }
+}
+```
+
+The same binary can act as a probe client with `-health-probe`, which queries the socket and maps state to an exit code (`0` = healthy, non-zero = unhealthy or unreachable). This makes it usable directly as a container healthcheck command:
+
+```dockerfile
+ENTRYPOINT ["aws-service-discovery-bootstrapper", "-namespace", "my-namespace", \
+            "-respawn", \
+            "-healthcheck-type", "http", "-healthcheck-target", "http://127.0.0.1:8080/healthz", \
+            "-control-socket", "/run/harness.sock", \
+            "--", "my-workload"]
+HEALTHCHECK CMD ["aws-service-discovery-bootstrapper", "-health-probe", "-control-socket", "/run/harness.sock"]
+```
+
+The probe client uses a short timeout, so a missing socket or dead harness reports unhealthy promptly rather than hanging.
 
 ## Configuration
 
