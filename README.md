@@ -16,7 +16,7 @@ aws-service-discovery-bootstrapper \
 You can install the AWS ServiceDiscovery bootstrapper using `go get`:
 
 ```bash
-go install @github.com/opencollector/aws-service-discovery-bootstrapper@latest
+go install github.com/moriyoshi/aws-service-discovery-bootstrapper@latest
 ```
 
 ## Usage
