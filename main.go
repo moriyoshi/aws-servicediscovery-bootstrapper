@@ -11,99 +11,57 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"net"
 	"net/http"
-	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
-	"reflect"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
-	"text/template"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
 	servicediscovery_types "github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
-	"github.com/cenkalti/backoff/v5"
+	"go.starlark.net/starlark"
 	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
 )
 
 var namespace string
-var healthStatus string
-var precondition string
-var preconditionCheckTimeout time.Duration
-var retryCount int
-var noFail bool
-var executionDelayJitter time.Duration
-var executionDelayJitterUnit time.Duration
 
-// respawn supervisor
-var respawnEnabled bool
-var respawnKeepAlive bool
-var respawnMaxRetries int
-var respawnInitialInterval time.Duration
-var respawnMaxInterval time.Duration
-var respawnMultiplier float64
-var respawnResetAfter time.Duration
-var shutdownGrace time.Duration
-
-// workload healthcheck
-var healthcheckType string
-var healthcheckTarget string
-var healthcheckInterval time.Duration
-var healthcheckTimeout time.Duration
-var healthcheckHealthyThreshold int
-var healthcheckUnhealthyThreshold int
-var healthcheckStartPeriod time.Duration
-var healthcheckAction string
-var healthcheckGRPCService string
+// Respawn/supervision and healthcheck settings are configured exclusively from
+// the script via the respawn() and healthcheck() builtins (see runtimeConfig).
 
 // control socket
 var controlSocket string
 var healthProbe bool
 
+// starlark engine
+var scriptPath string
+var kvTable string
+var kvKeyPrefix string
+var kvCreateTable bool
+var allowRun bool
+
 func init() {
 	flag.StringVar(&namespace, "namespace", "", "The namespace of the instance to be listed")
-	flag.StringVar(&healthStatus, "health-status", "HEALTHY", "The health status of the instance to be listed")
-	flag.StringVar(&precondition, "precondition", "AllEcsTasksRunning", "Precondition that needs to be met before running the command. Supported values: AllEcsTasksRunning")
-	flag.DurationVar(&preconditionCheckTimeout, "precondition-check-timeout", 30*time.Second, "The timeout for the precondition check")
-	flag.IntVar(&retryCount, "retry-count", 10, "The number of times to retry the request")
-	flag.BoolVar(&noFail, "no-fail", false, "Do not fail if no instances are found")
-	flag.DurationVar(&executionDelayJitter, "execution-delay-jitter", 0, "The amount of jitter that delays the command execution.")
-	flag.DurationVar(&executionDelayJitterUnit, "execution-delay-jitter-unit", time.Second, "The unit of the jitter that delays the command execution")
-
-	flag.BoolVar(&respawnEnabled, "respawn", false, "Restart the workload when it exits with a non-zero status")
-	flag.BoolVar(&respawnKeepAlive, "respawn-keep-alive", false, "Also restart the workload when it exits cleanly (implies -respawn semantics for exit code 0)")
-	flag.IntVar(&respawnMaxRetries, "respawn-max-retries", 5, "Maximum number of consecutive restarts before giving up (0 = unlimited)")
-	flag.DurationVar(&respawnInitialInterval, "respawn-initial-interval", time.Second, "Initial backoff interval between restarts")
-	flag.DurationVar(&respawnMaxInterval, "respawn-max-interval", 60*time.Second, "Maximum backoff interval between restarts")
-	flag.Float64Var(&respawnMultiplier, "respawn-multiplier", 2.0, "Backoff multiplier between restarts")
-	flag.DurationVar(&respawnResetAfter, "respawn-reset-after", 30*time.Second, "If the workload stays up at least this long, the retry/backoff counter is reset")
-	flag.DurationVar(&shutdownGrace, "shutdown-grace", 10*time.Second, "Grace period between SIGTERM and SIGKILL when terminating the workload")
-
-	flag.StringVar(&healthcheckType, "healthcheck-type", "", "Workload healthcheck type: http, https, tcp, grpc (empty = disabled)")
-	flag.StringVar(&healthcheckTarget, "healthcheck-target", "", "Healthcheck target: URL for http(s), host:port for tcp/grpc")
-	flag.DurationVar(&healthcheckInterval, "healthcheck-interval", 10*time.Second, "Interval between healthcheck probes")
-	flag.DurationVar(&healthcheckTimeout, "healthcheck-timeout", 2*time.Second, "Timeout for each healthcheck probe (must be less than the interval)")
-	flag.IntVar(&healthcheckHealthyThreshold, "healthcheck-healthy-threshold", 1, "Consecutive successful probes required to become healthy")
-	flag.IntVar(&healthcheckUnhealthyThreshold, "healthcheck-unhealthy-threshold", 3, "Consecutive failed probes required to become unhealthy")
-	flag.DurationVar(&healthcheckStartPeriod, "healthcheck-start-period", 0, "Grace period before the first probe during which failures are ignored")
-	flag.StringVar(&healthcheckAction, "healthcheck-action", "none", "Action on sustained unhealthy: none (observational) or restart")
-	flag.StringVar(&healthcheckGRPCService, "healthcheck-grpc-service", "", "Service name for the gRPC health check (default: overall server health)")
 
 	flag.StringVar(&controlSocket, "control-socket", "", "Path to a unix-domain control socket serving GET /health (empty = disabled)")
 	flag.BoolVar(&healthProbe, "health-probe", false, "Run as a health-probe client against -control-socket and exit 0 (healthy) or non-zero; for use as a container HEALTHCHECK CMD")
+
+	flag.StringVar(&scriptPath, "script", "", "Path to the Starlark script that resolves the workload and defines lifecycle hooks (required)")
+	flag.StringVar(&kvTable, "kv-table", "", "DynamoDB table name backing the kv_* builtins (empty = kv disabled)")
+	flag.StringVar(&kvKeyPrefix, "kv-key-prefix", "", "Prefix applied to all kv_* keys, to namespace multiple clusters on one table")
+	flag.BoolVar(&kvCreateTable, "kv-create-table", false, "Create the kv table (on-demand billing, TTL on expires_at) if it does not exist")
+	flag.BoolVar(&allowRun, "allow-run", false, "Expose the run() builtin to scripts (arbitrary command execution)")
 }
 
 type entry struct {
@@ -114,66 +72,62 @@ type entry struct {
 
 type serviceDiscovery struct {
 	svc       *servicediscovery.Client
-	namespace string
-	hsf       servicediscovery_types.HealthStatusFilter
-	maxTries  int
+	namespace string                                    // default namespace
+	hsf       servicediscovery_types.HealthStatusFilter // default health-status filter
 }
 
-func (sd *serviceDiscovery) do(ctx context.Context, service string) ([]entry, error) {
-	return backoff.Retry(
-		ctx,
-		func() ([]entry, error) {
-			out, err := sd.svc.DiscoverInstances(ctx, &servicediscovery.DiscoverInstancesInput{
-				NamespaceName: aws.String(sd.namespace),
-				ServiceName:   aws.String(service),
-				HealthStatus:  sd.hsf,
-			})
+// discover performs a single CloudMap DiscoverInstances call and returns the
+// matching instances. An empty result is returned as an empty slice, not an
+// error — scripts retry with poll and decide how to handle emptiness.
+// namespace and healthStatus override the defaults when non-empty.
+func (sd *serviceDiscovery) discover(ctx context.Context, namespace, service, healthStatus string) ([]entry, error) {
+	if namespace == "" {
+		namespace = sd.namespace
+	}
+	hsf := sd.hsf
+	if healthStatus != "" {
+		hsf = servicediscovery_types.HealthStatusFilter(healthStatus)
+		if slices.Index(servicediscovery_types.HealthStatusFilterAll.Values(), hsf) < 0 {
+			return nil, fmt.Errorf("invalid health status: %s", healthStatus)
+		}
+	}
+	out, err := sd.svc.DiscoverInstances(ctx, &servicediscovery.DiscoverInstancesInput{
+		NamespaceName: aws.String(namespace),
+		ServiceName:   aws.String(service),
+		HealthStatus:  hsf,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover instances: %w", err)
+	}
+	entries := make([]entry, 0, len(out.Instances))
+	for _, instance := range out.Instances {
+		ipv4Addr, ipv6Addr, port := "", "", 0
+		if v, ok := instance.Attributes["AWS_INSTANCE_IPV4"]; ok {
+			ipv4Addr = v
+		}
+		if v, ok := instance.Attributes["AWS_INSTANCE_IPV6"]; ok {
+			ipv6Addr = v
+		}
+		if v, ok := instance.Attributes["AWS_INSTANCE_PORT"]; ok {
+			port, err = strconv.Atoi(v)
 			if err != nil {
-				return nil, backoff.Permanent(fmt.Errorf("failed to discover instances: %w", err))
+				return nil, fmt.Errorf("failed to convert port to int: %w", err)
 			}
-			entries := make([]entry, 0, len(out.Instances))
-			for _, instance := range out.Instances {
-				ipv4Addr := ""
-				ipv6Addr := ""
-				port := 0
-				if v, ok := instance.Attributes["AWS_INSTANCE_IPV4"]; ok {
-					ipv4Addr = v
-				}
-				if v, ok := instance.Attributes["AWS_INSTANCE_IPV6"]; ok {
-					ipv6Addr = v
-				}
-				if v, ok := instance.Attributes["AWS_INSTANCE_PORT"]; ok {
-					port, err = strconv.Atoi(v)
-					if err != nil {
-						return nil, fmt.Errorf("failed to convert port to int: %w", err)
-					}
-				}
-				entries = append(entries, entry{IPv4Addr: ipv4Addr, IPv6Addr: ipv6Addr, Port: port})
-			}
-			if len(entries) == 0 {
-				return nil, errors.New("no instances found")
-			}
-			return entries, nil
-		},
-		backoff.WithBackOff(
-			&backoff.ExponentialBackOff{
-				InitialInterval:     2 * time.Second,
-				RandomizationFactor: backoff.DefaultRandomizationFactor,
-				Multiplier:          backoff.DefaultMultiplier,
-				MaxInterval:         60 * time.Second,
-			},
-		),
-		backoff.WithMaxTries(uint(sd.maxTries)),
-	)
+		}
+		entries = append(entries, entry{IPv4Addr: ipv4Addr, IPv6Addr: ipv6Addr, Port: port})
+	}
+	return entries, nil
 }
 
 type taskMetadataV4 struct {
-	Cluster     string `json:"Cluster"`
-	ServiceName string `json:"ServiceName"`
-	VPCID       string `json:"VPCID"`
-	TaskARN     string `json:"TaskARN"`
-	Family      string `json:"Family"`
-	Revision    string `json:"Revision"`
+	Cluster          string `json:"Cluster"`
+	ServiceName      string `json:"ServiceName"`
+	VPCID            string `json:"VPCID"`
+	TaskARN          string `json:"TaskARN"`
+	Family           string `json:"Family"`
+	Revision         string `json:"Revision"`
+	AvailabilityZone string `json:"AvailabilityZone"`
+	CreatedAt        string `json:"CreatedAt"`
 }
 
 func fetchContainerMetadata(ctx context.Context) (*taskMetadataV4, error) {
@@ -203,47 +157,48 @@ func fetchContainerMetadata(ctx context.Context) (*taskMetadataV4, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal container metadata: %w", err)
 	}
+	// CreatedAt is a per-container field, exposed at the container root endpoint
+	// rather than /task. Fetch it best-effort so scripts can use it (e.g. as a
+	// deterministic tie-break for seed election).
+	if metadata.CreatedAt == "" {
+		if creq, cerr := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil); cerr == nil {
+			if cresp, cerr := http.DefaultClient.Do(creq); cerr == nil {
+				defer cresp.Body.Close()
+				if cb, cerr := io.ReadAll(cresp.Body); cerr == nil {
+					var container struct {
+						CreatedAt string `json:"CreatedAt"`
+					}
+					if json.Unmarshal(cb, &container) == nil {
+						metadata.CreatedAt = container.CreatedAt
+					}
+				}
+			}
+		}
+	}
 	return metadata, nil
 }
 
-func waitForECSServiceUp(ctx context.Context, cfg *aws.Config, cluster string, service string, pollInterval time.Duration, timeout time.Duration) error {
-	client := ecs.NewFromConfig(*cfg)
-	timeoutAt := time.Now().Add(timeout)
-	for time.Now().Before(timeoutAt) {
-		out, err := client.DescribeServices(ctx, &ecs.DescribeServicesInput{
-			Cluster:  &cluster,
-			Services: []string{service},
-		})
-		if err != nil {
-			return fmt.Errorf("failed to describe ECS service: %w", err)
-		}
-		if len(out.Services) == 0 {
-			return fmt.Errorf("no ECS service found for %s", service)
-		}
-		if out.Services[0].RunningCount == out.Services[0].DesiredCount {
-			return nil // Service is up and running
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pollInterval):
-		}
-	}
-	return fmt.Errorf("ECS service %s is not up after %s", service, timeout)
+// ecsDescriber is the subset of the ECS client used to check service stability;
+// it lets tests inject a fake.
+type ecsDescriber interface {
+	DescribeServices(ctx context.Context, in *ecs.DescribeServicesInput, opts ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error)
 }
 
-func preconditionCheckECSService(ctx context.Context, cfg *aws.Config, pollInterval time.Duration, timeout time.Duration) error {
-	metadata, err := fetchContainerMetadata(ctx)
+// ecsServiceStable reports whether the ECS service has RunningCount ==
+// DesiredCount (i.e. all its tasks are running). It backs the
+// all_ecs_tasks_running() builtin.
+func ecsServiceStable(ctx context.Context, client ecsDescriber, cluster, service string) (bool, error) {
+	out, err := client.DescribeServices(ctx, &ecs.DescribeServicesInput{
+		Cluster:  &cluster,
+		Services: []string{service},
+	})
 	if err != nil {
-		return err
+		return false, fmt.Errorf("failed to describe ECS service: %w", err)
 	}
-	return waitForECSServiceUp(ctx, cfg, metadata.Cluster, metadata.ServiceName, pollInterval, timeout)
-}
-
-var preconditions = map[string]func(context.Context, *aws.Config, time.Duration, time.Duration) error{
-	"allecstasksrunning": func(ctx context.Context, cfg *aws.Config, pollInterval time.Duration, timeout time.Duration) error {
-		return preconditionCheckECSService(ctx, cfg, pollInterval, timeout)
-	},
+	if len(out.Services) == 0 {
+		return false, fmt.Errorf("no ECS service found for %s", service)
+	}
+	return out.Services[0].RunningCount == out.Services[0].DesiredCount, nil
 }
 
 // disableEndpointPrefix applies the flag that will prevent any
@@ -261,61 +216,6 @@ func (disableEndpointPrefix) HandleInitialize(
 
 func addDisableEndpointPrefix(stack *middleware.Stack) error {
 	return stack.Initialize.Add(disableEndpointPrefix{}, middleware.After)
-}
-
-func getValueByKey(rv reflect.Value, field string) (any, error) {
-	switch rv.Kind() {
-	case reflect.Struct:
-		f := rv.FieldByName(field)
-		if !f.IsValid() {
-			return "", fmt.Errorf("field %s not found in struct", field)
-		}
-		return f.Interface(), nil
-	case reflect.Map:
-		if rv.Type().Key().Kind() != reflect.String && rv.Type().Key().Kind() != reflect.Interface {
-			return "", fmt.Errorf("expected string or interface key, got %s", rv.Type().Key().Kind())
-		}
-		vv := rv.MapIndex(reflect.ValueOf(field))
-		if !vv.IsValid() {
-			return "", fmt.Errorf("key %s not found in map", field)
-		}
-		return vv.Interface(), nil
-	default:
-		return "", fmt.Errorf("expected struct or string keyied map, got %s", rv.Kind())
-	}
-}
-
-func convertStringSliceToAnySlice(entries []string) []any {
-	retval := make([]any, len(entries))
-	for i, entry := range entries {
-		retval[i] = entry
-	}
-	return retval
-}
-
-func getActualValueOf(rv reflect.Value) reflect.Value {
-	for rv.Kind() == reflect.Ptr || rv.Kind() == reflect.Interface {
-		rv = rv.Elem()
-	}
-	return rv
-}
-
-// isValidEnvName reports whether s is a valid environment variable name
-// ([A-Za-z_][A-Za-z0-9_]*), used to distinguish env NAME=VALUE operands from the
-// command to run.
-func isValidEnvName(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i, c := range s {
-		switch {
-		case c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'):
-		case i > 0 && c >= '0' && c <= '9':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // errRetriesExhausted is returned by superviseWorkload when the workload has
@@ -342,21 +242,31 @@ func (h healthState) String() string {
 	}
 }
 
-// harnessState is the single object shared between the supervisor, the
-// healthchecker and the control socket. All access goes through the methods
-// below, which hold mu.
+// harnessState is the registry shared between the supervisors and the control
+// socket: harness-level info plus one workloadState per spawn() call. Access goes
+// through methods that hold mu, so a snapshot sees a consistent cross-workload
+// view even while several supervisors update concurrently.
 type harnessState struct {
 	mu sync.RWMutex
 
-	startedAt         time.Time
-	workloadUp        bool
-	workloadPID       int
-	workloadStartedAt time.Time
-	lastExitCode      int
-	lastExitErr       string
-	respawnCount      int
-	maxRetries        int
-	currentBackoff    time.Duration
+	startedAt time.Time
+	workloads []*workloadState
+}
+
+// workloadState is the per-spawn() process + health state. Its mutators lock the
+// parent registry's mu; a supervisor only ever touches its own entry.
+type workloadState struct {
+	st   *harnessState
+	name string
+
+	up             bool
+	pid            int
+	startedAt      time.Time
+	lastExitCode   int
+	lastExitErr    string
+	respawnCount   int
+	maxRetries     int
+	currentBackoff time.Duration
 
 	health          healthState
 	consecutiveOK   int
@@ -365,77 +275,87 @@ type harnessState struct {
 	lastProbeErr    string
 }
 
-func newHarnessState(maxRetries int) *harnessState {
-	return &harnessState{startedAt: time.Now(), maxRetries: maxRetries}
+func newHarnessState() *harnessState {
+	return &harnessState{startedAt: time.Now()}
 }
 
-func (st *harnessState) setWorkloadUp(pid int) {
+// register adds a workload entry and returns its handle. name labels it in the
+// control-socket snapshot; an empty name is auto-assigned from its position.
+func (st *harnessState) register(name string, maxRetries int) *workloadState {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.workloadUp = true
-	st.workloadPID = pid
-	st.workloadStartedAt = time.Now()
-	st.currentBackoff = 0
+	if name == "" {
+		name = fmt.Sprintf("workload-%d", len(st.workloads))
+	}
+	w := &workloadState{st: st, name: name, maxRetries: maxRetries}
+	st.workloads = append(st.workloads, w)
+	return w
 }
 
-func (st *harnessState) setWorkloadDown(code int, err error) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.workloadUp = false
-	st.workloadPID = 0
-	st.lastExitCode = code
-	st.lastExitErr = errString(err)
+func (w *workloadState) setUp(pid int) {
+	w.st.mu.Lock()
+	defer w.st.mu.Unlock()
+	w.up = true
+	w.pid = pid
+	w.startedAt = time.Now()
+	w.currentBackoff = 0
 }
 
-func (st *harnessState) incRespawn(next time.Duration) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.respawnCount++
-	st.currentBackoff = next
+func (w *workloadState) setDown(code int, err error) {
+	w.st.mu.Lock()
+	defer w.st.mu.Unlock()
+	w.up = false
+	w.pid = 0
+	w.lastExitCode = code
+	w.lastExitErr = errString(err)
 }
 
-func (st *harnessState) resetRespawn() {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.currentBackoff = 0
+func (w *workloadState) incRespawn(next time.Duration) {
+	w.st.mu.Lock()
+	defer w.st.mu.Unlock()
+	w.respawnCount++
+	w.currentBackoff = next
 }
 
-func (st *harnessState) currentHealth() healthState {
-	st.mu.RLock()
-	defer st.mu.RUnlock()
-	return st.health
+func (w *workloadState) resetRespawn() {
+	w.st.mu.Lock()
+	defer w.st.mu.Unlock()
+	w.currentBackoff = 0
 }
 
-func (st *harnessState) setHealth(hs healthState, ok, fail int, probeErr error) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.health = hs
-	st.consecutiveOK = ok
-	st.consecutiveFail = fail
-	st.lastProbeAt = time.Now()
-	st.lastProbeErr = errString(probeErr)
+func (w *workloadState) setHealth(hs healthState, ok, fail int, probeErr error) {
+	w.st.mu.Lock()
+	defer w.st.mu.Unlock()
+	w.health = hs
+	w.consecutiveOK = ok
+	w.consecutiveFail = fail
+	w.lastProbeAt = time.Now()
+	w.lastProbeErr = errString(probeErr)
 }
 
-// stateSnapshot is a plain, JSON-serialisable copy of harnessState served by
-// the control socket and decoded by the health-probe client.
+// stateSnapshot is the JSON served by the control socket and decoded by the
+// health-probe client. workloads holds one entry per spawn().
 type stateSnapshot struct {
 	Harness struct {
 		Running       bool      `json:"running"`
 		StartedAt     time.Time `json:"started_at"`
 		UptimeSeconds float64   `json:"uptime_seconds"`
 	} `json:"harness"`
-	Workload struct {
-		Up                    bool      `json:"up"`
-		PID                   int       `json:"pid"`
-		StartedAt             time.Time `json:"started_at"`
-		UptimeSeconds         float64   `json:"uptime_seconds"`
-		RespawnCount          int       `json:"respawn_count"`
-		CurrentBackoffSeconds float64   `json:"current_backoff_seconds"`
-		MaxRetries            int       `json:"max_retries"`
-		LastExitCode          int       `json:"last_exit_code"`
-		LastExitError         string    `json:"last_exit_error"`
-	} `json:"workload"`
-	Health struct {
+	Workloads []workloadSnapshot `json:"workloads"`
+}
+
+type workloadSnapshot struct {
+	Name                  string    `json:"name"`
+	Up                    bool      `json:"up"`
+	PID                   int       `json:"pid"`
+	StartedAt             time.Time `json:"started_at"`
+	UptimeSeconds         float64   `json:"uptime_seconds"`
+	RespawnCount          int       `json:"respawn_count"`
+	CurrentBackoffSeconds float64   `json:"current_backoff_seconds"`
+	MaxRetries            int       `json:"max_retries"`
+	LastExitCode          int       `json:"last_exit_code"`
+	LastExitError         string    `json:"last_exit_error"`
+	Health                struct {
 		State           string    `json:"state"`
 		ConsecutiveOK   int       `json:"consecutive_ok"`
 		ConsecutiveFail int       `json:"consecutive_fail"`
@@ -452,22 +372,28 @@ func (st *harnessState) snapshot() stateSnapshot {
 	s.Harness.Running = true
 	s.Harness.StartedAt = st.startedAt
 	s.Harness.UptimeSeconds = now.Sub(st.startedAt).Seconds()
-	s.Workload.Up = st.workloadUp
-	s.Workload.PID = st.workloadPID
-	s.Workload.StartedAt = st.workloadStartedAt
-	if st.workloadUp && !st.workloadStartedAt.IsZero() {
-		s.Workload.UptimeSeconds = now.Sub(st.workloadStartedAt).Seconds()
+	s.Workloads = make([]workloadSnapshot, 0, len(st.workloads))
+	for _, w := range st.workloads {
+		var ws workloadSnapshot
+		ws.Name = w.name
+		ws.Up = w.up
+		ws.PID = w.pid
+		ws.StartedAt = w.startedAt
+		if w.up && !w.startedAt.IsZero() {
+			ws.UptimeSeconds = now.Sub(w.startedAt).Seconds()
+		}
+		ws.RespawnCount = w.respawnCount
+		ws.CurrentBackoffSeconds = w.currentBackoff.Seconds()
+		ws.MaxRetries = w.maxRetries
+		ws.LastExitCode = w.lastExitCode
+		ws.LastExitError = w.lastExitErr
+		ws.Health.State = w.health.String()
+		ws.Health.ConsecutiveOK = w.consecutiveOK
+		ws.Health.ConsecutiveFail = w.consecutiveFail
+		ws.Health.LastProbeAt = w.lastProbeAt
+		ws.Health.LastProbeError = w.lastProbeErr
+		s.Workloads = append(s.Workloads, ws)
 	}
-	s.Workload.RespawnCount = st.respawnCount
-	s.Workload.CurrentBackoffSeconds = st.currentBackoff.Seconds()
-	s.Workload.MaxRetries = st.maxRetries
-	s.Workload.LastExitCode = st.lastExitCode
-	s.Workload.LastExitError = st.lastExitErr
-	s.Health.State = st.health.String()
-	s.Health.ConsecutiveOK = st.consecutiveOK
-	s.Health.ConsecutiveFail = st.consecutiveFail
-	s.Health.LastProbeAt = st.lastProbeAt
-	s.Health.LastProbeError = st.lastProbeErr
 	return s
 }
 
@@ -491,16 +417,8 @@ func exitCodeOf(err error) int {
 	return -1
 }
 
-// healthProber probes the workload once and returns nil when it is healthy.
-type healthProber func(ctx context.Context, target string, timeout time.Duration) error
-
-var healthcheckers = map[string]healthProber{
-	"http":  probeHTTP,
-	"https": probeHTTP,
-	"tcp":   probeTCP,
-	"grpc":  probeGRPC,
-}
-
+// probeHTTP, probeTCP and probeGRPCService back the http_ok/tcp_ok/grpc_ok check
+// factories, which a script composes into readiness/liveness via poll().
 func probeHTTP(ctx context.Context, target string, timeout time.Duration) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
@@ -528,11 +446,11 @@ func probeTCP(ctx context.Context, target string, timeout time.Duration) error {
 	return conn.Close()
 }
 
-// probeGRPC performs a minimal grpc.health.v1.Health/Check over plaintext
+// probeGRPCService performs a minimal grpc.health.v1.Health/Check over plaintext
 // HTTP/2 (h2c) without pulling in the full gRPC runtime. It hand-encodes the
 // HealthCheckRequest and decodes the HealthCheckResponse from the length-prefixed
 // gRPC message framing.
-func probeGRPC(ctx context.Context, target string, timeout time.Duration) error {
+func probeGRPCService(ctx context.Context, target, service string, timeout time.Duration) error {
 	tr := &http2.Transport{
 		AllowHTTP: true,
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
@@ -545,8 +463,8 @@ func probeGRPC(ctx context.Context, target string, timeout time.Duration) error 
 
 	// HealthCheckRequest{ string service = 1 }
 	var msg []byte
-	if healthcheckGRPCService != "" {
-		svc := []byte(healthcheckGRPCService)
+	if service != "" {
+		svc := []byte(service)
 		msg = append(msg, 0x0A) // field 1, wire type 2 (length-delimited)
 		msg = binary.AppendUvarint(msg, uint64(len(svc)))
 		msg = append(msg, svc...)
@@ -639,171 +557,6 @@ func parseGRPCHealthStatus(frame []byte) (int, error) {
 	return 0, nil // no status field => UNKNOWN
 }
 
-// runHealthcheck probes the workload periodically and records the result in st.
-// When restartCh is non-nil (healthcheck-action=restart), a sustained-unhealthy
-// transition sends one restart request to the supervisor.
-func runHealthcheck(ctx context.Context, logger *slog.Logger, st *harnessState, prober healthProber, target string, restartCh chan<- struct{}) error {
-	if healthcheckStartPeriod > 0 {
-		logger.Info("healthcheck start period", slog.Duration("duration", healthcheckStartPeriod))
-		select {
-		case <-time.After(healthcheckStartPeriod):
-		case <-ctx.Done():
-			return nil
-		}
-	}
-	logger.Info("healthcheck started", slog.String("type", healthcheckType), slog.String("target", target), slog.Duration("interval", healthcheckInterval))
-	ticker := time.NewTicker(healthcheckInterval)
-	defer ticker.Stop()
-	ok, fail := 0, 0
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-		}
-		probeCtx, cancel := context.WithTimeout(ctx, healthcheckTimeout)
-		err := prober(probeCtx, target, healthcheckTimeout)
-		cancel()
-
-		prev := st.currentHealth()
-		hs := prev
-		if err == nil {
-			ok++
-			fail = 0
-			if ok >= healthcheckHealthyThreshold {
-				hs = healthHealthy
-			}
-			st.setHealth(hs, ok, fail, nil)
-			if hs == healthHealthy && prev != healthHealthy {
-				logger.Info("workload became healthy")
-			}
-		} else {
-			fail++
-			ok = 0
-			if fail >= healthcheckUnhealthyThreshold {
-				hs = healthUnhealthy
-			}
-			st.setHealth(hs, ok, fail, err)
-			if hs == healthUnhealthy && prev != healthUnhealthy {
-				logger.Warn("workload became unhealthy", slog.String("err", err.Error()), slog.Int("consecutive_fail", fail))
-			}
-			if hs == healthUnhealthy && restartCh != nil {
-				select {
-				case restartCh <- struct{}{}:
-					fail = 0 // reset so we don't spam restarts
-					logger.Warn("requesting workload restart due to unhealthy status")
-				default:
-				}
-			}
-		}
-	}
-}
-
-// superviseWorkload runs the workload and, when respawning is enabled, restarts
-// it with exponential backoff up to respawnMaxRetries. It is signal-aware:
-// cancelling ctx relays SIGTERM to the child (SIGKILL after shutdownGrace).
-func superviseWorkload(ctx context.Context, logger *slog.Logger, st *harnessState, argv, env []string, restartCh <-chan struct{}) error {
-	bo := &backoff.ExponentialBackOff{
-		InitialInterval:     respawnInitialInterval,
-		RandomizationFactor: backoff.DefaultRandomizationFactor,
-		Multiplier:          respawnMultiplier,
-		MaxInterval:         respawnMaxInterval,
-	}
-	bo.Reset()
-	attempts := 0
-	for {
-		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-		cmd.Env = env
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Stdin = os.Stdin
-		// Graceful termination on ctx cancel: SIGTERM, then SIGKILL after WaitDelay.
-		cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
-		cmd.WaitDelay = shutdownGrace
-
-		startedAt := time.Now()
-		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("failed to start command: %w", err)
-		}
-		pid := cmd.Process.Pid
-		st.setWorkloadUp(pid)
-		logger.Info("workload started", slog.Int("pid", pid), slog.Int("attempt", attempts))
-
-		waitCh := make(chan error, 1)
-		go func() { waitCh <- cmd.Wait() }()
-
-		var waitErr error
-		healthTriggered := false
-		select {
-		case <-ctx.Done():
-			waitErr = <-waitCh
-			st.setWorkloadDown(exitCodeOf(waitErr), waitErr)
-			logger.Info("workload exited during shutdown", slog.String("err", errString(waitErr)))
-			return nil
-		case <-restartCh:
-			healthTriggered = true
-			logger.Info("terminating workload for health-triggered restart", slog.Int("pid", pid))
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-			select {
-			case waitErr = <-waitCh:
-			case <-time.After(shutdownGrace):
-				_ = cmd.Process.Kill()
-				waitErr = <-waitCh
-			case <-ctx.Done():
-				waitErr = <-waitCh
-				st.setWorkloadDown(exitCodeOf(waitErr), waitErr)
-				return nil
-			}
-		case waitErr = <-waitCh:
-		}
-
-		code := exitCodeOf(waitErr)
-		st.setWorkloadDown(code, waitErr)
-		uptime := time.Since(startedAt)
-		logger.Info("workload exited", slog.Int("exit_code", code), slog.String("err", errString(waitErr)), slog.Duration("uptime", uptime))
-
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-
-		if uptime >= respawnResetAfter {
-			bo.Reset()
-			attempts = 0
-			st.resetRespawn()
-		}
-
-		if !healthTriggered {
-			if !respawnEnabled {
-				if waitErr != nil {
-					return fmt.Errorf("failed to run command: %w", waitErr)
-				}
-				return nil
-			}
-			if code == 0 && !respawnKeepAlive {
-				return nil
-			}
-		}
-
-		attempts++
-		if respawnMaxRetries != 0 && attempts > respawnMaxRetries {
-			return errRetriesExhausted
-		}
-		d := bo.NextBackOff()
-		if d == backoff.Stop {
-			return errRetriesExhausted
-		}
-		st.incRespawn(d)
-		logger.Info("respawning workload", slog.Duration("backoff", d), slog.Int("attempt", attempts), slog.Int("max_retries", respawnMaxRetries))
-		select {
-		case <-time.After(d):
-		case <-ctx.Done():
-			return nil
-		}
-	}
-}
-
 // serveControlSocket exposes GET /health over a unix-domain socket.
 func serveControlSocket(ctx context.Context, logger *slog.Logger, st *harnessState, path string) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -885,113 +638,40 @@ func runHealthProbe(ctx context.Context, path string) error {
 	if n := len(body); n == 0 || body[n-1] != '\n' {
 		os.Stdout.Write([]byte("\n"))
 	}
-	switch snap.Health.State {
-	case "healthy":
-		return nil
-	case "unknown":
-		// healthchecks disabled: fall back to whether the workload is running
-		if snap.Workload.Up {
-			return nil
-		}
-		return fmt.Errorf("workload is not up")
-	default:
-		return fmt.Errorf("workload health is %s", snap.Health.State)
+	// The container is healthy only when every workload is: a workload with a
+	// health probe must be "healthy"; one without a probe ("unknown") falls back
+	// to being up. Any unhealthy or down workload fails the probe.
+	if len(snap.Workloads) == 0 {
+		return fmt.Errorf("no workloads running")
 	}
+	for _, w := range snap.Workloads {
+		switch w.Health.State {
+		case "healthy":
+			// ok
+		case "unknown":
+			if !w.Up {
+				return fmt.Errorf("workload %s is not up", w.Name)
+			}
+		default:
+			return fmt.Errorf("workload %s health is %s", w.Name, w.Health.State)
+		}
+	}
+	return nil
 }
 
 func doIt(ctx context.Context, logger *slog.Logger) error {
 	if namespace == "" {
 		return fmt.Errorf("namespace is required")
 	}
-	if retryCount < 0 {
-		return fmt.Errorf("retry count must be greater than or equal to 0")
-	}
-	if healthcheckType != "" {
-		if _, ok := healthcheckers[strings.ToLower(healthcheckType)]; !ok {
-			return fmt.Errorf("invalid healthcheck type: %s", healthcheckType)
-		}
-		if healthcheckTarget == "" {
-			return fmt.Errorf("healthcheck target is required when a healthcheck type is set")
-		}
-		if healthcheckInterval <= 0 {
-			return fmt.Errorf("healthcheck interval must be positive")
-		}
-		if healthcheckTimeout <= 0 || healthcheckTimeout >= healthcheckInterval {
-			return fmt.Errorf("healthcheck timeout must be positive and less than the interval")
-		}
-		if healthcheckHealthyThreshold < 1 || healthcheckUnhealthyThreshold < 1 {
-			return fmt.Errorf("healthcheck thresholds must be at least 1")
-		}
-	}
-	switch strings.ToLower(healthcheckAction) {
-	case "", "none", "restart":
-	default:
-		return fmt.Errorf("invalid healthcheck action: %s", healthcheckAction)
-	}
-	if strings.EqualFold(healthcheckAction, "restart") && healthcheckType == "" {
-		return fmt.Errorf("healthcheck action 'restart' requires a healthcheck type")
-	}
-	if respawnEnabled {
-		if respawnMultiplier <= 1 {
-			return fmt.Errorf("respawn multiplier must be greater than 1")
-		}
-		if respawnMaxRetries < 0 {
-			return fmt.Errorf("respawn max retries must be greater than or equal to 0")
-		}
-	}
-	var preconditionFunc func(context.Context, *aws.Config, time.Duration, time.Duration) error
-	if precondition != "" {
-		var ok bool
-		preconditionFunc, ok = preconditions[strings.ToLower(precondition)]
-		if !ok {
-			return fmt.Errorf("invalid precondition: %s", precondition)
-		}
-	}
-	hsf := servicediscovery_types.HealthStatusFilter(healthStatus)
-	i := slices.Index[[]servicediscovery_types.HealthStatusFilter](
-		servicediscovery_types.HealthStatusFilterAll.Values(),
-		hsf,
-	)
-	if i < 0 {
-		return fmt.Errorf("invalid health status: %s", healthStatus)
-	}
+	// respawn/healthcheck settings come from the script's respawn()/healthcheck()
+	// calls; preconditions are folded into pre_start() via the ECS builtins. Both
+	// are validated / applied after the script loads.
+	// The trailing args after `--` are optional now; they are exposed to the
+	// script as the COMMAND global so a script can transform a base command.
 	cmdLine := flag.Args()
-	if len(cmdLine) < 1 {
-		return fmt.Errorf("command is required")
-	}
 
-	// env utility emulation: if the first token is literally "env", consume the
-	// leading NAME=VALUE operands and set them as environment variables on the
-	// command being run. Only the NAME=VALUE form is supported (no options). The
-	// VALUE part is interpolated with the same template functions as the argv.
-	type envAssignment struct {
-		name      string
-		valueTmpl string
-	}
-	var envAssignments []envAssignment
-	if cmdLine[0] == "env" {
-		i := 1
-		for ; i < len(cmdLine); i++ {
-			arg := cmdLine[i]
-			eq := strings.IndexByte(arg, '=')
-			if eq <= 0 || !isValidEnvName(arg[:eq]) {
-				break
-			}
-			envAssignments = append(envAssignments, envAssignment{
-				name:      arg[:eq],
-				valueTmpl: arg[eq+1:],
-			})
-		}
-		cmdLine = cmdLine[i:]
-		if len(cmdLine) < 1 {
-			return fmt.Errorf("command is required")
-		}
-	}
-
-	var err error
-	cmdLine[0], err = exec.LookPath(cmdLine[0])
-	if err != nil {
-		return fmt.Errorf("command not found: %s", cmdLine[0])
+	if scriptPath == "" {
+		return fmt.Errorf("-script is required")
 	}
 
 	cfg, err := config.LoadDefaultConfig(ctx)
@@ -1010,9 +690,6 @@ func doIt(ctx context.Context, logger *slog.Logger) error {
 		loggerOpts := []any{
 			slog.String("aws_region", cfg.Region),
 			slog.String("namespace", namespace),
-			slog.String("health_status", healthStatus),
-			slog.Int("retries", retryCount),
-			slog.Bool("no_fail", noFail),
 		}
 		if cfg.BaseEndpoint != nil {
 			loggerOpts = append(loggerOpts, slog.String("aws_endpoint", *cfg.BaseEndpoint))
@@ -1025,256 +702,104 @@ func doIt(ctx context.Context, logger *slog.Logger) error {
 	sd := &serviceDiscovery{
 		svc:       svc,
 		namespace: namespace,
-		hsf:       hsf,
-		maxTries:  retryCount + 1,
+		hsf:       servicediscovery_types.HealthStatusFilterHealthy,
 	}
 
-	ifAddrCache := make(map[string]string)
-	funcMap := template.FuncMap{
-		"instances": func(service string) ([]entry, error) {
-			entries, err := sd.do(ctx, service)
-			if err != nil {
-				if !noFail {
-					return nil, err
-				}
-			}
-			return entries, nil
-		},
-		"exclude": func(addr string, entries []entry) ([]entry, error) {
-			retval := make([]entry, 0, len(entries))
-			for _, entry := range entries {
-				if entry.IPv4Addr == addr || entry.IPv6Addr == addr {
-					continue
-				}
-				retval = append(retval, entry)
-			}
-			return retval, nil
-		},
-		"extract": func(field string, entries any) ([]any, error) {
-			fields := strings.Split(field, ",")
-			for i, field := range fields {
-				fields[i] = strings.TrimSpace(field)
-			}
-			rv := getActualValueOf(reflect.ValueOf(entries))
-			if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
-				return nil, fmt.Errorf("expected array or slice, got %s", rv.Kind())
-			}
-			retval := make([]any, rv.Len())
-			if len(fields) == 1 {
-				for i := 0; i < rv.Len(); i++ {
-					v, err := getValueByKey(getActualValueOf(rv.Index(i)), fields[0])
-					if err != nil {
-						return nil, fmt.Errorf("failed to get value by key %s: %w", field, err)
-					}
-					retval[i] = v
-				}
-			} else {
-				for i := 0; i < rv.Len(); i++ {
-					vv := make([]any, len(fields))
-					for j, field := range fields {
-						v, err := getValueByKey(getActualValueOf(rv.Index(i)), field)
-						if err != nil {
-							return nil, fmt.Errorf("failed to get value by key %s: %w", field, err)
-						}
-						vv[j] = v
-					}
-					retval[i] = vv
-				}
-			}
-			return retval, nil
-		},
-		"mapprintf": func(format string, entries any) ([]string, error) {
-			switch entries := entries.(type) {
-			case []string:
-				retval := make([]string, len(entries))
-				for i, entry := range entries {
-					retval[i] = fmt.Sprintf(format, entry)
-				}
-				return retval, nil
-			case [][]any:
-				retval := make([]string, len(entries))
-				for i, entry := range entries {
-					retval[i] = fmt.Sprintf(format, entry...)
-				}
-				return retval, nil
-			case [][]string:
-				retval := make([]string, len(entries))
-				for i, entry := range entries {
-					retval[i] = fmt.Sprintf(format, convertStringSliceToAnySlice(entry)...)
-				}
-				return retval, nil
-			default:
-				rentries := getActualValueOf(reflect.ValueOf(entries))
-				if rentries.Kind() != reflect.Slice && rentries.Kind() != reflect.Array {
-					return nil, fmt.Errorf("expected []any, or [#]any, got %s", rentries.Kind())
-				}
-				retval := make([]string, rentries.Len())
-				for i := range retval {
-					rentry := getActualValueOf(rentries.Index(i))
-					if rentry.Kind() != reflect.Slice && rentry.Kind() != reflect.Array {
-						retval[i] = fmt.Sprintf(format, rentry.Interface())
-					} else {
-						args := make([]any, rentry.Len())
-						for j := 0; j < rentry.Len(); j++ {
-							args[j] = rentry.Index(j).Interface()
-						}
-						retval[i] = fmt.Sprintf(format, args...)
-					}
-				}
-				return retval, nil
-			}
-		},
-		"join": func(sep string, entries any) (string, error) {
-			switch entries := entries.(type) {
-			case []string:
-				return strings.Join(entries, sep), nil
-			case []any:
-				var result strings.Builder
-				for i, entry := range entries {
-					if i > 0 {
-						result.WriteString(sep)
-					}
-					result.WriteString(getActualValueOf(reflect.ValueOf(entry)).String())
-				}
-				return result.String(), nil
-			default:
-				return "", fmt.Errorf("expected []string or []any, got %s", reflect.TypeOf(entries))
-			}
-		},
-		"ifaddr": func(cidr string) (string, error) {
-			if addrStr, ok := ifAddrCache[cidr]; ok {
-				return addrStr, nil
-			}
-			pfx, err := netip.ParsePrefix(cidr)
-			if err != nil {
-				return "", fmt.Errorf("failed to parse CIDR: %w", err)
-			}
-			ifs, err := net.Interfaces()
-			if err != nil {
-				return "", fmt.Errorf("failed to get interfaces: %w", err)
-			}
-			for _, if_ := range ifs {
-				addrs, err := if_.Addrs()
-				if err != nil {
-					return "", fmt.Errorf("failed to get interface addresses: %w", err)
-				}
-				if if_.Flags&net.FlagUp == 0 {
-					continue
-				}
-				if if_.Flags&net.FlagPointToPoint != 0 {
-					continue
-				}
-				if if_.Flags&net.FlagLoopback != 0 {
-					continue
-				}
-				for _, addr := range addrs {
-					ip, err := netip.ParsePrefix(addr.String())
-					if err != nil {
-						return "", fmt.Errorf("failed to parse address: %w", err)
-					}
-					if pfx.Contains(ip.Addr()) {
-						addrStr := ip.Addr().String()
-						ifAddrCache[cidr] = addrStr
-						return addrStr, nil
-					}
-				}
-			}
-			return "", fmt.Errorf("no applicable interfaces found")
-		},
+	// Task metadata is exposed to the script as the TASK global and used to
+	// derive the kv owner id. Best-effort: outside ECS it is simply absent.
+	meta, err := fetchContainerMetadata(ctx)
+	if err != nil {
+		logger.Warn("task metadata unavailable", slog.String("err", err.Error()))
+		meta = nil
 	}
 
-	cmdLineT := make([]*template.Template, len(cmdLine)-1)
-	for i, arg := range cmdLine[1:] {
-		t, err := template.New(strconv.Itoa(i)).Funcs(funcMap).Parse(arg)
-		if err != nil {
-			return fmt.Errorf("failed to parse command line: %w", err)
+	// Optional DynamoDB-backed kv store for the kv_* builtins (seed election).
+	var kv kvStore
+	if kvTable != "" {
+		ddb := dynamodb.NewFromConfig(cfg)
+		owner := ""
+		if meta != nil && meta.TaskARN != "" {
+			owner = meta.TaskARN
+		} else if hn, herr := os.Hostname(); herr == nil {
+			owner = hn
 		}
-		cmdLineT[i] = t
-	}
-
-	envValueT := make([]*template.Template, len(envAssignments))
-	for i, a := range envAssignments {
-		t, err := template.New("env" + strconv.Itoa(i)).Funcs(funcMap).Parse(a.valueTmpl)
-		if err != nil {
-			return fmt.Errorf("failed to parse env value for %s: %w", a.name, err)
+		dkv := newDynamoKV(ddb, kvTable, kvKeyPrefix, owner)
+		if kvCreateTable {
+			if err := dkv.ensureTable(ctx); err != nil {
+				return fmt.Errorf("failed to ensure kv table: %w", err)
+			}
 		}
-		envValueT[i] = t
+		kv = dkv
+		logger.Info("kv store enabled", slog.String("table", kvTable), slog.String("owner", owner))
 	}
 
-	if preconditionFunc != nil {
-		logger.Info("checking precondition", slog.String("precondition", precondition))
-		if err := preconditionFunc(ctx, &cfg, 3*time.Second, preconditionCheckTimeout); err != nil {
-			return fmt.Errorf("precondition check failed: %w", err)
-		}
+	st := newHarnessState()
+	deps := &engineDeps{
+		logger:   logger,
+		sd:       sd,
+		kv:       kv,
+		ecs:      ecs.NewFromConfig(cfg),
+		meta:     meta,
+		command:  cmdLine,
+		allowRun: allowRun,
+		st:       st,
+		ifCache:  map[string]string{},
 	}
 
-	delay := executionDelayJitterUnit * time.Duration(
-		rand.Int64N(
-			int64(executionDelayJitter)/int64(executionDelayJitterUnit)+1,
-		),
-	)
-	logger.Info("delaying execution", slog.Duration("delay", delay))
-	time.Sleep(delay)
-
-	renderedCmdLine := make([]string, len(cmdLine))
-	renderedCmdLine[0] = cmdLine[0]
-	for i, t := range cmdLineT {
-		var buf bytes.Buffer
-		if err := t.Execute(&buf, nil); err != nil {
-			return fmt.Errorf("failed to execute template: %w", err)
-		}
-		renderedCmdLine[i+1] = buf.String()
-	}
-
-	extraEnv := make([]string, len(envValueT))
-	envNames := make([]string, len(envValueT))
-	for i, t := range envValueT {
-		var buf bytes.Buffer
-		if err := t.Execute(&buf, nil); err != nil {
-			return fmt.Errorf("failed to execute env template for %s: %w", envAssignments[i].name, err)
-		}
-		extraEnv[i] = envAssignments[i].name + "=" + buf.String()
-		envNames[i] = envAssignments[i].name
-	}
-
-	logger.Info("running", slog.Any("argv", renderedCmdLine), slog.Any("env", envNames))
-
-	argv := renderedCmdLine
-	env := append(os.Environ(), extraEnv...)
-
-	// Orchestrate the supervisor plus the optional background legs (healthcheck
-	// and control socket) under a shared, cancellable context. Each leg cancels
-	// the context on return, so a clean supervisor exit also tears down the
-	// background legs (which errgroup.WithContext alone would not do).
-	st := newHarnessState(respawnMaxRetries)
 	gctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var restartCh chan struct{}
-	if healthcheckType != "" && strings.EqualFold(healthcheckAction, "restart") {
-		restartCh = make(chan struct{}, 1)
+	eng, err := loadScript(gctx, scriptPath, deps)
+	if err != nil {
+		return err
 	}
 
+	// The control socket runs concurrently under gctx, reading the shared state.
 	var g errgroup.Group
-	if healthcheckType != "" {
-		prober := healthcheckers[strings.ToLower(healthcheckType)]
-		g.Go(func() error {
-			defer cancel()
-			return runHealthcheck(gctx, logger, st, prober, healthcheckTarget, restartCh)
-		})
-	}
 	if controlSocket != "" {
-		g.Go(func() error {
-			defer cancel()
-			return serveControlSocket(gctx, logger, st, controlSocket)
-		})
+		g.Go(func() error { return serveControlSocket(gctx, logger, st, controlSocket) })
 	}
-	g.Go(func() error {
-		defer cancel()
-		return superviseWorkload(gctx, logger, st, argv, env, restartCh)
-	})
-	return g.Wait()
+
+	// main() drives and returns the workload promise; the harness awaits it and
+	// delivers SIGTERM/SIGINT to it via signal() (graceful stop), falling back to
+	// cancel() for a non-signallable promise. A hard deadline caps teardown.
+	p, err := eng.callMain(gctx)
+	if err != nil {
+		cancel()
+		_ = g.Wait()
+		return err
+	}
+
+	var hardCh <-chan time.Time
+	shutdown := gctx.Done()
+	var awaitErr error
+loop:
+	for {
+		select {
+		case <-p.doneCh:
+			awaitErr = p.err
+			break loop
+		case <-shutdown:
+			if p.signallable {
+				p.doSignal(starlark.None)
+			} else {
+				p.doCancel()
+			}
+			hardCh = time.After(hardShutdownGrace)
+			shutdown = nil
+		case <-hardCh:
+			awaitErr = fmt.Errorf("workload did not stop within %s of shutdown signal", hardShutdownGrace)
+			break loop
+		}
+	}
+	cancel()
+	_ = g.Wait()
+	return awaitErr
 }
+
+// hardShutdownGrace caps how long the harness waits for graceful teardown after
+// delivering the shutdown signal to main()'s promise.
+const hardShutdownGrace = 60 * time.Second
 
 func main() {
 	flag.Parse()
