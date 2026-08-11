@@ -1,15 +1,30 @@
 # AWS ServiceDiscovery (a.k.a. Cloud Map) bootstrapper
 
-AWS ServiceDiscovery bootstrapper is a helper utility that enables any executables to run with arguments interpolated with instance attributes associated in CloudMap services.
+AWS ServiceDiscovery bootstrapper is a container entrypoint that computes a workload's command line from AWS CloudMap service discovery and supervises the process. The command line and the process lifecycle are driven by a small **[Starlark](https://github.com/google/starlark-go)** script, so it can express the imperative decisions that clustered stateful systems (e.g. TiKV/PD) need at startup — *am I bootstrapping a new cluster, joining an existing one, or restarting an existing member?* — rather than just string interpolation.
 
-For example, if you have a CloudMap namespace `my-namespace` and a service `my-service` with two instances `192.168.0.2` and `192.168.0.3`, each assigned a port attribute of `8000`, running the following command will invoke `my-executable` with the argument `--servers=http://192.168.0.2:8000,http://192.168.0.3:8000`
+The script is **imperative and async**. It defines one required `main()` function that drives everything and **returns a promise** representing the workload; the harness awaits that promise and, on `SIGTERM`/`SIGINT`, delivers a graceful-stop `signal()` to it. `main()` calls `spawn()`, which supervises the workload — it resolves the argv, runs it, respawns it, and drives script-supplied `readiness`/`liveness` promise factories — passing every callback by reference (`resolve`, `pre_start`, `post_start`, `pre_stop`, `post_stop`, `readiness`, `liveness`). Async primitives — `go()`, `poll()`, `promise()`, `join()`, `select()` — let `main()` coordinate (seed election, ordering, multiple workloads) and react to health imperatively. Builtins also expose CloudMap discovery, the host's interface addresses, filesystem checks, HTTP/TCP/gRPC probes, ECS preconditions, and a conditional-write key/value store backed by DynamoDB.
+
+For example, this script builds a `--servers` argument from the healthy instances of `my-service` and supervises the workload:
+
+```python
+# servers.star
+def resolver():
+    peers = instances("my-service")
+    urls = ["http://%s:%d" % (p.ipv4, p.port) for p in peers]
+    return COMMAND + ["--servers=" + ",".join(urls)]
+
+def main():
+    return spawn(resolve=resolver, respawn=True)
+```
 
 ```bash
 aws-service-discovery-bootstrapper \
   -namespace my-namespace \
-  <executable> \
-    '--servers={{ instances "my-service" | extract "IPv4Addr,Port" | mapprintf "http://%s:%d" | join "," }}'
+  -script servers.star \
+  -- my-executable
 ```
+
+> **Note:** the previous `text/template` interpolation mode and the declarative `respawn()`/`healthcheck()` builtins have been **removed** in favor of this imperative model. See [Migrating](#migrating).
 
 ## Installation
 
@@ -24,243 +39,252 @@ go install github.com/moriyoshi/aws-service-discovery-bootstrapper@latest
 ```bash
 aws-service-discovery-bootstrapper \
   -namespace <namespace> \
-  -health-status <health-status> \
-  -retry <retry-count> \
-  -execution-delay-jitter <delay> \
-  -execution-delay-jitter-unit <unit> \
-  [-no-fail] \
-  [-respawn [-respawn-keep-alive] [-respawn-max-retries <n>] ...] \
-  [-healthcheck-type <http|https|tcp|grpc> -healthcheck-target <target> ...] \
+  -script <path> \
+  [-kv-table <name> [-kv-key-prefix <prefix>] [-kv-create-table]] \
+  [-allow-run] \
   [-control-socket <path>] \
-  -- <executable> [args...]
+  -- [command...]
 ```
+
+The trailing `command...` after `--` is optional; it is passed to the script as the `COMMAND` global so a script can transform a base command rather than build argv from scratch.
 
 <dl>
 <dt><code>-namespace</code></dt>
 <dd>
 
-**Required.** The namespace to use for service discovery.
+**Required.** The default namespace for the `instances()` builtin (overridable per call via its `namespace` argument).
 </dd>
-<dt><code>-health-status</code></dt>
-<dd>
+> Supervision (respawn) and healthchecking (readiness/liveness) are configured **from the script** as `spawn()` arguments — there are no CLI flags for them. Retrying discovery until instances appear is also scripted: `instances()` is a single lookup that returns an empty list when nothing matches; wrap it in `poll` (join it for a synchronous wait). See [Scripting](#scripting).
 
-The health status to use for service discovery. Default is `HEALTHY`.
-
-Valid values are:
-- `HEALTHY`: Include only healthy instances.
-- `UNHEALTHY`: Include only unhealthy instances.
-- `ALL`: Include all instances.
-- `HEALTHY_OR_ELSE_ALL`: Include only healthy instances, or all instances if no healthy instances are found.
-</dd>
-<dt><code>-retry</code></dt>
-<dd>
-The number of times to retry service discovery if no instances that matches the specified health status are found. Default is `3`.
-</dd>
-<dt><code>-precondition</code></dt>
-<dd>
-
-A precondition to check before running the command. If the precondition is not met, the command will not be executed.
-
-Valid values are:
-- `AllEcsTasksRunning`: The command will only be executed if all ECS tasks in the cluster are running.
-</dd>
-<dt><code>-precondition-check-timeout</code></dt>
-<dd>
-
-The timeout for the precondition check. If the precondition check does not complete within the specified timeout, the command will not be executed. The timeout can be specified with a suffix of `s` (seconds), `ms` (milliseconds), `us` (microseconds), or `ns` (nanoseconds). Default is `30s`.
-</dd>
-<dt><code>-execution-delay-jitter</code></dt>
-<dd>
-
-The amount of jitter that delays the command execution. This is useful to give more chance to the command to run successfully if the services being discovered are not available yet.  The amount can be specified with a suffix of `s` (seconds), `ms` (milliseconds), `us` (microseconds), or `ns` (nanoseconds). Default is `0s`.
-</dd>
-<dt><code>-execution-delay-jitter-unit</code></dt>
-<dd>
-
-The unit of the execution delay jitter. Some of valid values are `1s` (seconds), `1ms` (milliseconds), `1us` (microseconds), `1ns` (nanoseconds). Default is `1s`.
-</dd>
-<dt><code>-no-fail</code></dt>
-<dd>
-
-If specified, `instances` function will not fail if no instances that match the specified health status are found. Note that retries will still be attempted if this option is specified.
-</dd>
-<dt><code>-respawn</code></dt>
-<dd>
-
-Restart the workload when it exits with a **non-zero** status, up to `-respawn-max-retries` times, with exponential backoff between restarts. A clean exit (status `0`) ends the harness successfully unless `-respawn-keep-alive` is also given. This lets the container survive transient workload failures. Default is off. See [Respawning](#respawning).
-</dd>
-<dt><code>-respawn-keep-alive</code></dt>
-<dd>
-
-Also restart the workload when it exits cleanly (status `0`), i.e. keep it alive regardless of exit status. Implies `-respawn` semantics for exit code `0`. Default is off.
-</dd>
-<dt><code>-respawn-max-retries</code></dt>
-<dd>
-
-Maximum number of **consecutive** restarts before the harness gives up and exits non-zero. `0` means unlimited. The counter is reset once the workload has stayed up for at least `-respawn-reset-after` (see below). Default is `5`.
-</dd>
-<dt><code>-respawn-initial-interval</code> / <code>-respawn-max-interval</code> / <code>-respawn-multiplier</code></dt>
-<dd>
-
-The exponential-backoff parameters used between restarts: the first interval, the ceiling, and the multiplier. Defaults are `1s`, `60s`, and `2.0`. Backoff is jittered.
-</dd>
-<dt><code>-respawn-reset-after</code></dt>
-<dd>
-
-If the workload stays up at least this long, the retry counter and backoff are reset (min-healthy time). This prevents a workload that runs fine for a while and then crashes from eventually exhausting its retries. Default is `30s`.
-</dd>
-<dt><code>-shutdown-grace</code></dt>
-<dd>
-
-Grace period between `SIGTERM` and `SIGKILL` when terminating the workload (on harness shutdown or a health-triggered restart). When the harness receives `SIGTERM`/`SIGINT`, it relays `SIGTERM` to the workload and waits up to this long before force-killing. Default is `10s`.
-</dd>
-<dt><code>-healthcheck-type</code></dt>
-<dd>
-
-Enable a background workload healthcheck of the given type: `http`, `https`, `tcp`, or `grpc`. Empty (the default) disables healthchecking. See [Healthcheck](#healthcheck).
-</dd>
-<dt><code>-healthcheck-target</code></dt>
-<dd>
-
-The probe target. For `http`/`https` it is a URL (a `2xx` response is healthy). For `tcp` it is `host:port` (a successful connection is healthy). For `grpc` it is `host:port` of a server implementing the standard [gRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) (a `SERVING` status is healthy). gRPC is probed over plaintext HTTP/2 (h2c).
-</dd>
-<dt><code>-healthcheck-interval</code> / <code>-healthcheck-timeout</code></dt>
-<dd>
-
-Interval between probes and the per-probe timeout. The timeout must be positive and less than the interval. Defaults are `10s` and `2s`.
-</dd>
-<dt><code>-healthcheck-healthy-threshold</code> / <code>-healthcheck-unhealthy-threshold</code></dt>
-<dd>
-
-The number of consecutive successful / failed probes required to transition to `healthy` / `unhealthy`. Defaults are `1` and `3`.
-</dd>
-<dt><code>-healthcheck-start-period</code></dt>
-<dd>
-
-A grace period before the first probe during which probe failures are ignored (they do not count toward the unhealthy threshold), giving the workload time to start. Default is `0`.
-</dd>
-<dt><code>-healthcheck-action</code></dt>
-<dd>
-
-What to do when the workload becomes `unhealthy`: `none` (default, observational — the state is only exposed via the control socket) or `restart` (kill and respawn the workload; requires `-healthcheck-type` and is subject to the respawn retry/backoff settings).
-</dd>
-<dt><code>-healthcheck-grpc-service</code></dt>
-<dd>
-
-The service name passed in the gRPC `HealthCheckRequest`. Empty (the default) queries overall server health.
-</dd>
 <dt><code>-control-socket</code></dt>
 <dd>
 
-Path to a unix-domain socket on which the harness serves `GET /health` (JSON). Exposes harness-level state (uptime, respawn count, current backoff) and the workload health. Empty (the default) disables it. See [Control socket and health probe](#control-socket-and-health-probe).
+Path to a unix-domain socket on which the harness serves `GET /health` (JSON). Exposes harness-level state (uptime) and a per-workload array (up/pid, respawn count, current backoff, health) — one entry per `spawn()`. Empty (the default) disables it. See [Control socket and health probe](#control-socket-and-health-probe).
 </dd>
 <dt><code>-health-probe</code></dt>
 <dd>
 
 Run the binary as a **health-probe client** instead of the harness: it connects to `-control-socket`, and exits `0` when healthy or non-zero otherwise. Intended for use as a container `HEALTHCHECK CMD`. See [Control socket and health probe](#control-socket-and-health-probe).
 </dd>
-<dt><code>&lt;executable&gt;</code></dt>
+<dt><code>-script</code></dt>
 <dd>
 
-**Required.** The executable to run with the interpolated arguments.
+**Required.** Path to the Starlark script that defines `resolve()` and the optional lifecycle hooks. See [Scripting](#scripting).
 </dd>
-<dt><code>[args...]</code></dt>
+<dt><code>-kv-table</code></dt>
 <dd>
 
-The arguments to pass to the executable. These can include interpolated values from CloudMap services. How the interpolation works is described below.
+DynamoDB table name backing the `kv_*` builtins. Empty (the default) disables the key/value store; calling a `kv_*` builtin then raises an error. See [Key/value store (DynamoDB)](#keyvalue-store-dynamodb).
+</dd>
+<dt><code>-kv-key-prefix</code></dt>
+<dd>
+
+Prefix prepended to every `kv_*` key, so multiple clusters can share one table without colliding. Default is empty.
+</dd>
+<dt><code>-kv-create-table</code></dt>
+<dd>
+
+Create the kv table (on-demand billing, TTL enabled on `expires_at`) if it does not already exist. Default is off; normally the table is provisioned out of band (Terraform/CDK).
+</dd>
+<dt><code>-allow-run</code></dt>
+<dd>
+
+Expose the `run([...])` builtin, which executes an arbitrary command. Off by default to keep the sandbox tight; prefer `http_request` where possible.
+</dd>
+<dt><code>[command...]</code></dt>
+<dd>
+
+Optional trailing command after `--`, exposed to the script as the `COMMAND` global (a list of strings).
 </dl>
 
-### `env` emulation
+## Scripting
 
-If the first token of the command is literally `env`, the bootstrapper emulates the `env` utility: any leading `NAME=VALUE` operands are consumed and set as environment variables on the executable that follows. The first operand that is not of the form `NAME=VALUE` begins the actual command.
+The workload lifecycle is defined by an imperative [Starlark](https://github.com/google/starlark-go) script (a small Python dialect). The only required global is **`main()`**, which returns a promise; the harness awaits it and, on `SIGTERM`/`SIGINT`, delivers a graceful-stop `signal()` to it. Every other function is ordinary — wire the ones you need into `spawn()` by reference.
 
-```bash
-aws-service-discovery-bootstrapper \
-  -namespace <namespace> \
-  -- env SERVERS='{{ join "," (extract "IPv4Addr" (instances "my-service")) }}' <executable> [args...]
+### `main()` and `spawn()`
+
+`main()` does any up-front coordination and returns the workload promise from `spawn()`:
+
+```python
+def resolver():                 # per-attempt: return argv (list) or {"argv":[...], "env":{...}}
+    return COMMAND
+
+def readiness():                # a Promise that resolves when the workload is ready
+    return poll(http_ok("http://127.0.0.1:8080/ready"), "60s")
+
+def on_stop():                  # runs once on teardown
+    deregister()
+
+def main():
+    # coordinate here (seed election, ordering) …
+    return spawn(resolve=resolver, pre_stop=on_stop, readiness=readiness, respawn=True)
 ```
 
-The `VALUE` part is interpolated with the same functions available for arguments (see [Interpolation](#interpolation) below), so computed values can be passed as environment variables. Because the variables are handed directly to the process rather than through a shell, discovered values are safe even if they contain shell metacharacters.
+`spawn(...)` owns the respawn loop and the readiness/liveness probes. Its arguments:
 
-Only the `NAME=VALUE` form is supported. `env` options (such as `-i`, `-u`, `-C`, or `-S`) are **not** supported; an operand starting with `-` is treated as the command to run and will fail as "command not found". Assignments are applied in order and override any inherited variable of the same name.
+<dl>
+<dt><code>resolve</code> (required)</dt>
+<dd>
 
-## Interpolation
+A function returning the workload argv each attempt — a list of strings, or `{"argv":[...], "env":{...}}`. Runs before every (re)spawn, so a clustered workload can re-decide its role (restart / join / bootstrap) after a crash.
+</dd>
+<dt><code>name</code></dt>
+<dd>
 
-The AWS ServiceDiscovery bootstrapper uses the [go-template](https://golang.org/pkg/text/template/) syntax for interpolation. The following functions are available:
+Optional label for this workload in the control-socket snapshot (auto-assigned `workload-<n>` by position if omitted). Give each workload a distinct name when `main()` runs more than one.
+</dd>
+<dt><code>pre_start</code> / <code>post_start</code> / <code>pre_stop</code> / <code>post_stop</code></dt>
+<dd>
 
-- `instances <service-name>`: Returns a slice of structs that describes instances for the specified service name.
-    Each struct contains the following fields:
-    - `IPv4Addr`: The IPv4 address of the instance.
-    - `IPv6Addr`: The IPv6 address of the instance.
-    - `Port`: The port of the instance.
+Optional lifecycle callbacks around each attempt:
+- **`pre_start`** — before the process starts. The only hard gate: an error aborts the attempt (respawns if enabled, else fails). Use it to wait on dependencies.
+- **`post_start`** — right after the process is up (PID known). Best-effort (a failure is logged, not fatal — gate on being ready with `readiness`). Use it to record/notify a just-launched process.
+- **`pre_stop`** — when the workload is torn down (shutdown, liveness-restart, or exit), **while the process is still alive**. Runs under a detached, time-bounded context (`pre_stop_timeout`, else `shutdown_grace`) so it can deregister while peers are still reachable.
+- **`post_stop`** — after the process has **fully exited**. Best-effort, detached/time-bounded like `pre_stop`. Use it for cleanup that needs the process gone (pid files, final deregistration).
+</dd>
+<dt><code>readiness</code> / <code>liveness</code></dt>
+<dd>
 
-- `extract <attribute> <slice>`: For each item of a slice, extracts the specified attribute(s) from the instances, and returns the slice of slices of extracted attributes. `<attribute>` can be a comma-separated list of attributes (e.g. `IPv4Addr,Port`).
+Optional functions returning a **promise** (see below), called by `spawn()` per attempt. A truthy `readiness` marks the workload ready (control socket); if it never resolves truthy the attempt is restarted. When `liveness` settles truthy (liveness lost) the workload is marked unhealthy and, if `restart_on_liveness=True` (default), restarted. Intervene (register/deregister) as a side effect inside these callbacks.
+</dd>
+<dt>respawn policy</dt>
+<dd>
 
-    Example: `extract "IPv4Addr,Port"` will return a slice of slices, where each inner slice contains the IPv4 address and port of an instance.
+`respawn=False`, `keep_alive=False`, `max_retries=5` (0 = unlimited), `initial_interval="1s"`, `max_interval="60s"`, `multiplier=2.0`, `reset_after="30s"`, `shutdown_grace="10s"`, `pre_stop_timeout=0`, `resolve_timeout=0`, `resolve_failure="retry"`, `restart_on_liveness=True`. With `respawn=True`, a non-zero exit restarts with jittered exponential backoff up to `max_retries`; `keep_alive=True` also restarts a clean exit; the counter resets after the workload stays up `reset_after`.
+</dd>
+</dl>
 
-- `exclude <ip-addr> <slice>`: Excludes a item whose any of IP addresses corresponds to the specified IP address from the slice. The IP address can be an IPv4 or IPv6 address.
+The returned promise is **signallable**: `w.signal()` requests a graceful stop (stop respawning → `pre_stop` → `SIGTERM`→`shutdown_grace`→`SIGKILL`) and resolves with a `{code, respawn_count, reason}` struct. Retries exhausted → the promise **rejects** and the process exits non-zero.
 
-    Example: `exclude (ifaddr "192.168.0.0/24")` will exclude the instance whose IPv4 address matches the host's IP address.
+### Promises
 
-- `mapprintf <format> <input>`: For each item of a slice, formats the value with the specified format string. The format is done using the [fmt.Sprintf](https://golang.org/pkg/fmt/#Sprintf) syntax.
-   
-   Example: `mapprintf "http://%s:%d"` will format the IPv4 address and port of each instance into a URL.
+Async primitives let `main()` coordinate and react. A **promise** is a settle-once future.
 
-- `join <separator> <input>`: Joins the items of a slice into a single string, separated by the specified separator.
+- `go(fn, *args) -> promise`: run `fn(*args)` on a background task; resolves with its return, rejects on error. The general async primitive. (`fn` and its args are frozen — read captured state, don't mutate after launch.)
+- `poll(check, timeout, interval=1s) -> promise`: resolves `True` when `check()` becomes truthy, `False` on timeout, rejects on a `check` error. The idiomatic way to build `readiness`/`liveness`. For a **synchronous** wait, join it: `join(poll(check, "60s"))` blocks the current task and returns the bool.
+- `promise() -> promise`: a bare deferred you settle yourself via `p.signal(value)` / `p.reject(err)`.
+- `join(*p) -> value|list`: await all; returns the value (or a list for many); **raises** on any rejection or cancellation.
+- `select(*p) -> promise`: race; returns the first-settled promise (compare by identity: `if select(a, b) == a`).
+- `any_true(*p) -> bool`: race for the first promise to resolve **truthy** → `True` (cancelling the rest); `False` once all resolve falsy; **raises** on rejection. Short-circuiting concurrent predicate — e.g. "is any peer up?": `any_true(*[go(http_ok(PD(p))) for p in peers])`.
 
-    Example: `join ","` will join the items of a slice with a comma.
+Every promise has `p.done()`. **Cancellable** promises (`go`/`poll`) add `p.cancel()` (abort and discard → resolves `None`). **Signallable** promises (`spawn()`, bare `promise()`) add `p.signal(value)` / `p.reject(err)`. `go`/`poll` accept `signallable=True`; `promise()` accepts `cancellable=`/`signallable=`.
 
-- `ifaddr <CIDR>`: Returns the address that matches the CIDR if exists.
+### Globals
 
-    Example: `ifaddr 192.168.0.0/24` will return the IPv4 address of the instance that matches the CIDR.
+- `COMMAND`: the trailing `--` command as a list of strings.
+- `TASK`: ECS task metadata struct with `.cluster`, `.service_name`, `.task_arn`, `.availability_zone`, `.created_at`, `.family`, `.revision`, `.vpc_id` (or `None` outside ECS).
 
-## Respawning
+### Builtins
 
-By default the bootstrapper runs the workload once and exits with its status. With `-respawn`, it instead supervises the workload and restarts it on failure, so the container can survive transient failures:
+**Discovery / networking**
+- `instances(service, health_status=None, namespace=None)`: one CloudMap `DiscoverInstances` lookup → list of structs with `.ipv4`, `.ipv6`, `.port`. No internal retry; an empty result is an empty list — wrap in `poll` (join it) for a quorum. `namespace` overrides `-namespace`; `health_status` overrides the default `HEALTHY` (`HEALTHY`/`UNHEALTHY`/`ALL`/`HEALTHY_OR_ELSE_ALL`).
+- `ifaddr(cidr)`: the host's own address within `cidr`.
 
-- A **non-zero** exit triggers a restart (up to `-respawn-max-retries`, with exponential backoff). Add `-respawn-keep-alive` to also restart on a clean exit.
-- The retry counter and backoff reset once the workload has been up for at least `-respawn-reset-after`, so a long-lived workload that eventually crashes is not penalised by earlier restarts.
-- When the retries are exhausted, the harness exits non-zero.
-- The harness is termination-signal aware: on `SIGTERM`/`SIGINT` it relays `SIGTERM` to the workload, waits up to `-shutdown-grace`, then `SIGKILL`s it. Such a shutdown is not counted as a failure and does not trigger a respawn.
+**ECS (preconditions)** — cluster/service default to the running task's own:
+- `all_ecs_tasks_running(cluster=None, service=None)` → bool: `RunningCount == DesiredCount`. Gate on it in `pre_start`: `if not join(poll(all_ecs_tasks_running, "60s")): fail(...)`.
 
-```bash
-aws-service-discovery-bootstrapper \
-  -namespace <namespace> \
-  -respawn -respawn-max-retries 10 -respawn-initial-interval 1s -respawn-max-interval 60s \
-  -- <executable> [args...]
+**Filesystem** (read-only): `path_exists(path)`, `read_file(path)` (≤1 MiB).
+
+**Health / HTTP**
+- `http_ok(url, timeout=2s)`, `tcp_ok(hostport, timeout=2s)`, `grpc_ok(hostport, service="", timeout=2s)` → a **check factory**: each captures its target and returns a zero-arg callable that runs the probe and returns a bool. Pass it straight to `poll`/`go` (`poll(http_ok(url), "60s")`) or call it for the bool inline (`if http_ok(url)(): ...`).
+- `un(fn, *args)` → a check factory computing `not fn(*args)`. Negates a probe without a lambda: `poll(un(http_ok(url, "2s")), "24h")` resolves when the target stops being live.
+- `http_request(method, url, body=None, headers={}, timeout=30s)` → `{status, body}` (e.g. a PD member delete via HTTP `DELETE`).
+
+**Key/value store** — see [below](#keyvalue-store-dynamodb).
+
+**Misc**: `env(name, default=None)` → str (reads the harness's own environment), `log(msg, **kwargs)`, `sleep(seconds)` (cancellable), `rand()` → float `[0.0, 1.0)`, `randint(a, b)` (inclusive, like `random.randint`), and `run([...])` → `{code, stdout, stderr}` (only with `-allow-run`).
+
+Durations accept a number of seconds or a string like `"5s"` / `"500ms"`. Blocking builtins are cancelled when the harness shuts down.
+
+### Key/value store (DynamoDB)
+
+When `-kv-table` is set, the `kv_*` builtins provide a conditional-write key/value store backed by DynamoDB. Atomic put-if-absent and compare-and-swap with TTL leases make it a distributed lock, which is what lets exactly one node win seed election during a cold start (avoiding split-brain).
+
+- `kv_put_if_absent(key, val, ttl=None)` → bool. Writes only if the key is absent or its lease has expired. **The seed-election primitive.**
+- `kv_compare_and_swap(key, old, new, ttl=None)` → bool.
+- `kv_get(key)` → str or `None`. To wait for a key, compose with `poll`: `join(poll(lambda: kv_get(k) != None, "120s"))`, then `kv_get(k)`.
+- `kv_delete(key, if_value=None)` → bool.
+- `kv_renew(key, ttl)` → bool. Extends a lease you own; `False` means the lease was lost.
+
+A `ttl` of `None`/`0` is a permanent key; a positive `ttl` is a lease that expires (and frees the lock) if the holder dies.
+
+**Table schema.** Partition key `pk` (String), value `val` (String), and `expires_at` (Number, Unix epoch seconds) configured as the table's **TTL attribute**. Provision it out of band, or pass `-kv-create-table` to create it (on-demand billing, TTL enabled) on first run. Use `-kv-key-prefix` to share one table across clusters.
+
+**IAM.** The task role needs `dynamodb:GetItem`, `PutItem`, `UpdateItem`, and `DeleteItem` on the table. With `-kv-create-table`, also `CreateTable`, `DescribeTable`, and `UpdateTimeToLive`.
+
+### Example: PD restart / join / bootstrap
+
+```python
+# pd.star  —  run with: -kv-table <table> -allow-run -- /pd-server
+PD = lambda ip: "http://%s:2379" % ip
+
+def resolver():
+    me = ifaddr("172.31.255.0/24")
+    peers = [i.ipv4 for i in instances("tikv-pd") if i.ipv4 != me]
+
+    if path_exists("/pd/member"):                        # (A) restart existing member
+        mode = []
+    elif peers and any_true(*[go(http_ok(PD(p) + "/pd/api/v1/members")) for p in peers]):
+        mode = ["--join", ",".join([PD(p) for p in peers])]   # (B) cluster exists → join (probes race)
+    elif kv_put_if_absent("tikv-pd/seed", me, "90s"):    # (C) win the lease → bootstrap
+        mode = []
+    else:                                                # someone else is seeding → wait, then join
+        join(poll(lambda: kv_get("tikv-pd/seed") != None, "120s"))
+        seed = kv_get("tikv-pd/seed")
+        join(poll(http_ok(PD(seed) + "/pd/api/v1/health"), "120s"))
+        mode = ["--join", PD(seed)]
+
+    return COMMAND + ["--advertise-client-urls", PD(me),
+                      "--advertise-peer-urls", "http://%s:2380" % me] + mode
+
+def liveness():                                          # settles when PD stops being live
+    me = ifaddr("172.31.255.0/24")
+    return poll(un(http_ok(PD(me) + "/pd/api/v1/health", "2s")), "24h", interval="10s")
+
+def on_stop():
+    me = ifaddr("172.31.255.0/24")
+    run(["/pd-ctl", "-u", PD(me), "member", "delete", "name", TASK.task_arn])
+    kv_delete("tikv-pd/seed", if_value = me)
+
+def main():
+    return spawn(resolve=resolver, liveness=liveness, pre_stop=on_stop,
+                 respawn=True, max_retries=0)   # keep restarting; liveness loss → restart
 ```
 
-## Healthcheck
+### Migrating
 
-With `-healthcheck-type`, a background goroutine probes the workload on an interval and tracks a tri-state health (`unknown` → `healthy` / `unhealthy`) using consecutive-success/failure thresholds and an optional start period:
+The `text/template` interpolation and the declarative `resolve()`/`respawn()`/`healthcheck()` model have been removed. In the current model:
 
-- `http` / `https`: an HTTP `GET` of `-healthcheck-target`; a `2xx` response is healthy.
-- `tcp`: a TCP connection to `host:port`; a successful connect is healthy.
-- `grpc`: the standard [gRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) `Check` over plaintext HTTP/2 (h2c); a `SERVING` status is healthy. Use `-healthcheck-grpc-service` to query a specific service.
-
-The healthcheck is **observational** by default — the state is exposed via the control socket. Set `-healthcheck-action=restart` to have a sustained-unhealthy workload killed and respawned (subject to the respawn settings above).
+- Define **`main()`** (the only required global); it returns a promise, usually from `spawn()`.
+- Pass the argv provider and lifecycle callbacks to `spawn()` by reference (any names): `resolve`, `pre_start`, `post_start`, `pre_stop`, `post_stop`, `readiness`, `liveness`.
+- The old `respawn(...)` knobs are now `spawn(...)` arguments.
+- The old `healthcheck(probe=...)` becomes a `readiness`/`liveness` function returning a promise (typically `poll(...)`); `spawn()` drives it and restarts on liveness loss (`restart_on_liveness`).
+- List comprehensions replace the old `extract`/`mapprintf`/`join`/`exclude` template funcs (`["http://%s:%d" % (p.ipv4, p.port) for p in instances("s")]`); env goes in the resolve dict `{"argv":[...], "env":{...}}`.
 
 ## Control socket and health probe
 
-With `-control-socket <path>`, the harness serves `GET /health` (JSON) over a unix-domain socket, reporting both harness-level state and workload health:
+With `-control-socket <path>`, the harness serves `GET /health` (JSON) over a unix-domain socket. Because `main()` can `spawn()` more than one workload, the payload carries harness-level state plus a **`workloads` array** — one entry per `spawn()`, each with its own process, respawn, and health fields:
 
 ```json
 {
-  "harness":  { "running": true, "started_at": "…", "uptime_seconds": 123.4 },
-  "workload": { "up": true, "pid": 4321, "started_at": "…", "uptime_seconds": 100.2,
-                "respawn_count": 2, "current_backoff_seconds": 0, "max_retries": 5,
-                "last_exit_code": 0, "last_exit_error": "" },
-  "health":   { "state": "healthy", "consecutive_ok": 3, "consecutive_fail": 0,
-                "last_probe_at": "…", "last_probe_error": "" }
+  "harness": { "running": true, "started_at": "…", "uptime_seconds": 123.4 },
+  "workloads": [
+    { "name": "pd", "up": true, "pid": 4321, "started_at": "…", "uptime_seconds": 100.2,
+      "respawn_count": 2, "current_backoff_seconds": 0, "max_retries": 5,
+      "last_exit_code": 0, "last_exit_error": "",
+      "health": { "state": "healthy", "consecutive_ok": 3, "consecutive_fail": 0,
+                  "last_probe_at": "…", "last_probe_error": "" } }
+  ]
 }
 ```
 
-The same binary can act as a probe client with `-health-probe`, which queries the socket and maps state to an exit code (`0` = healthy, non-zero = unhealthy or unreachable). This makes it usable directly as a container healthcheck command:
+Each workload's `name` is its `spawn(name=…)` argument (auto-assigned `workload-<n>` by position if omitted). A workload's `health.state` is `healthy`/`unhealthy`/`unknown` (`unknown` = no `readiness`/`liveness` configured).
+
+The same binary can act as a probe client with `-health-probe`, which queries the socket and maps state to an exit code (`0` = healthy, non-zero = unhealthy or unreachable). The container is reported healthy only when **every** workload is healthy — a workload with no health probe falls back to being up, and any unhealthy or down workload fails the probe. This makes it usable directly as a container healthcheck command:
 
 ```dockerfile
 ENTRYPOINT ["aws-service-discovery-bootstrapper", "-namespace", "my-namespace", \
-            "-respawn", \
-            "-healthcheck-type", "http", "-healthcheck-target", "http://127.0.0.1:8080/healthz", \
+            "-script", "/workload.star", \
             "-control-socket", "/run/harness.sock", \
             "--", "my-workload"]
 HEALTHCHECK CMD ["aws-service-discovery-bootstrapper", "-health-probe", "-control-socket", "/run/harness.sock"]
@@ -282,4 +306,20 @@ The AWS ServiceDiscovery bootstrapper can be configured using environment variab
 
 - `AWS_SESSION_TOKEN`: The AWS session token to use for service discovery. If not set, the default credentials from the AWS CLI configuration will be used.
 
-- `AWS_ENDPOINT_URL`: The AWS endpoint URL to use for service discovery. If not set, the default endpoint URL from the AWS CLI configuration will be used. Specifying this will effectively disable the endpoint prefixing behavior. (Thus the actual endpoint will end up being the same as the endpoint URL, in contrast to `data-servicediscovery.<region>.amazonaws.com` where the endpoint is `servicediscovery.<region>.amazonaws.com`.)
+- `AWS_ENDPOINT_URL`: The AWS endpoint URL to use. If not set, the default endpoint URL from the AWS CLI configuration will be used. Specifying this will effectively disable the endpoint prefixing behavior. (Thus the actual endpoint will end up being the same as the endpoint URL, in contrast to `data-servicediscovery.<region>.amazonaws.com` where the endpoint is `servicediscovery.<region>.amazonaws.com`.) The override applies to the ServiceDiscovery (CloudMap), ECS, and DynamoDB clients alike, so all three can be pointed at a single mock endpoint for testing.
+
+## Testing
+
+Unit tests (including seed-election and lifecycle-hook coverage using an in-memory kv store) run with:
+
+```bash
+go test ./...
+```
+
+An opt-in end-to-end test exercises the DynamoDB-backed kv store and seed election against a real, stateful AWS emulator — [Winterbäume](https://github.com/moriyoshi/winterbaume) in its standalone `winterbaume-server` mode, which speaks the DynamoDB, ECS, and CloudMap APIs over one HTTP endpoint. It is build-tag gated and skipped unless an endpoint is provided:
+
+```bash
+winterbaume-server &   # or any DynamoDB-compatible endpoint
+AWS_ENDPOINT_URL=http://127.0.0.1:8080 AWS_REGION=us-east-1 \
+  go test -tags=e2e -run E2E ./...
+```

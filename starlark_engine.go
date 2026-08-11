@@ -1,0 +1,176 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"sync"
+
+	"go.starlark.net/starlark"
+)
+
+// engineDeps carries everything the Starlark builtins need at call time. It is
+// shared across concurrent hook/task invocations; the only mutable field is the
+// ifMu-guarded ifCache. Module globals are frozen after load, so concurrent
+// starlark.Call across threads is safe.
+type engineDeps struct {
+	logger   *slog.Logger
+	sd       *serviceDiscovery
+	kv       kvStore
+	ecs      ecsDescriber
+	meta     *taskMetadataV4
+	command  []string
+	allowRun bool
+
+	eng *engine       // back-reference so go()/spawn() can launch tasks
+	st  *harnessState // shared control-socket state, set by doIt
+
+	ifMu    sync.Mutex
+	ifCache map[string]string
+}
+
+// engine wraps a loaded Starlark script. main() is the only required global; all
+// other functions are ordinary values the script wires into spawn() by reference.
+type engine struct {
+	deps    *engineDeps
+	globals starlark.StringDict
+	main    *starlark.Function
+}
+
+// loadScript compiles and evaluates the script at path and extracts main().
+func loadScript(ctx context.Context, path string, deps *engineDeps) (*engine, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read script: %w", err)
+	}
+	e := &engine{deps: deps}
+	deps.eng = e
+	predeclared := buildPredeclared(deps)
+	thread := &starlark.Thread{Name: "load", Print: printFunc(deps.logger)}
+	thread.SetLocal("ctx", ctx)
+	globals, err := starlark.ExecFile(thread, path, src, predeclared)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load script %s: %w", path, err)
+	}
+	e.globals = globals
+	mainFn, ok := globals["main"].(*starlark.Function)
+	if !ok {
+		return nil, fmt.Errorf("script must define a main() function")
+	}
+	e.main = mainFn
+	return e, nil
+}
+
+func printFunc(logger *slog.Logger) func(*starlark.Thread, string) {
+	return func(_ *starlark.Thread, msg string) {
+		logger.Info("starlark", slog.String("print", msg))
+	}
+}
+
+// invokeValue runs a callable on a fresh, ctx-carrying thread. A watchdog cancels
+// the interpreter if ctx is done, so a callable stuck in a blocking builtin or a
+// pure-Starlark loop is interruptible. There is no global lock: module globals
+// are frozen, so concurrent invocations across goroutines are safe.
+func (e *engine) invokeValue(ctx context.Context, fn starlark.Value, args starlark.Tuple) (starlark.Value, error) {
+	name := "task"
+	if n, ok := fn.(interface{ Name() string }); ok {
+		name = n.Name()
+	}
+	thread := &starlark.Thread{Name: name, Print: printFunc(e.deps.logger)}
+	thread.SetLocal("ctx", ctx)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			thread.Cancel("context canceled")
+		case <-done:
+		}
+	}()
+	defer close(done)
+	return starlark.Call(thread, fn, args, nil)
+}
+
+// spawnFunc runs a Go closure asynchronously on its own cancellable task ctx and
+// returns a cancellable promise settled with the closure's result. An intentional
+// cancel settles as resolved(None) rather than rejected.
+func (e *engine) spawnFunc(ctx context.Context, name string, run func(context.Context) (starlark.Value, error), signallable bool) *promise {
+	taskCtx, cancel := context.WithCancel(ctx)
+	p := newPromise(name)
+	p.cancellable = true
+	p.cancelFn = cancel
+	p.signallable = signallable
+	go func() {
+		defer cancel()
+		v, err := run(taskCtx)
+		if err != nil {
+			if p.isCanceling() {
+				p.settle(starlark.None, nil)
+				return
+			}
+			p.reject(err)
+			return
+		}
+		p.resolve(v)
+	}()
+	return p
+}
+
+// spawnTask is spawnFunc for a Starlark callable (the go() builtin).
+func (e *engine) spawnTask(ctx context.Context, name string, fn starlark.Value, args starlark.Tuple, signallable bool) *promise {
+	return e.spawnFunc(ctx, name, func(taskCtx context.Context) (starlark.Value, error) {
+		return e.invokeValue(taskCtx, fn, args)
+	}, signallable)
+}
+
+// callMain runs main() and requires it to return a promise.
+func (e *engine) callMain(ctx context.Context) (*promise, error) {
+	v, err := e.invokeValue(ctx, e.main, nil)
+	if err != nil {
+		return nil, err
+	}
+	p, ok := v.(*promise)
+	if !ok {
+		return nil, fmt.Errorf("main() must return a promise, got %s", v.Type())
+	}
+	return p, nil
+}
+
+func parseResolveResult(v starlark.Value) ([]string, []string, error) {
+	switch t := v.(type) {
+	case *starlark.Dict:
+		argvVal, found, err := t.Get(starlark.String("argv"))
+		if err != nil {
+			return nil, nil, err
+		}
+		if !found {
+			return nil, nil, fmt.Errorf("resolve(): result dict must contain 'argv'")
+		}
+		argv, err := starlarkToStrings(argvVal)
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolve(): argv: %w", err)
+		}
+		var env []string
+		if envVal, found, _ := t.Get(starlark.String("env")); found && envVal != starlark.None {
+			env, err = starlarkDictToEnv(envVal)
+			if err != nil {
+				return nil, nil, fmt.Errorf("resolve(): env: %w", err)
+			}
+		}
+		if len(argv) == 0 {
+			return nil, nil, fmt.Errorf("resolve(): argv must be non-empty")
+		}
+		return argv, env, nil
+	case *starlark.List, starlark.Tuple:
+		argv, err := starlarkToStrings(v)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(argv) == 0 {
+			return nil, nil, fmt.Errorf("resolve(): argv must be non-empty")
+		}
+		return argv, nil, nil
+	default:
+		return nil, nil, fmt.Errorf("resolve() must return a dict{argv,env} or a list of argv strings, got %s", v.Type())
+	}
+}
