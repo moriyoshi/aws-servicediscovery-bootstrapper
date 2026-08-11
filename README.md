@@ -1,6 +1,8 @@
-# AWS ServiceDiscovery (a.k.a. Cloud Map) bootstrapper
+# muster
 
-AWS ServiceDiscovery bootstrapper is a container entrypoint that computes a workload's command line from AWS CloudMap service discovery and supervises the process. The command line and the process lifecycle are driven by a small **[Starlark](https://github.com/google/starlark-go)** script, so it can express the imperative decisions that clustered stateful systems (e.g. TiKV/PD) need at startup — *am I bootstrapping a new cluster, joining an existing one, or restarting an existing member?* — rather than just string interpolation.
+> *muster* — to assemble scattered members into formation before they act.
+
+**muster** is a container entrypoint for clustered stateful workloads. Replicas start up not knowing who they are: muster discovers its peers through AWS CloudMap (a.k.a. ServiceDiscovery), coordinates with them to settle roles, computes the workload's command line, then starts and supervises the process. Discovery, coordination, argv, and the process lifecycle are all driven by a small **[Starlark](https://github.com/google/starlark-go)** script, so it can express the imperative decisions that clustered stateful systems (e.g. TiKV/PD) need at startup — *am I bootstrapping a new cluster, joining an existing one, or restarting an existing member?* — rather than just string interpolation.
 
 The script is **imperative and async**. It defines one required `main()` function that drives everything and **returns a promise** representing the workload; the harness awaits that promise and, on `SIGTERM`/`SIGINT`, delivers a graceful-stop `signal()` to it. `main()` calls `spawn()`, which supervises the workload — it resolves the argv, runs it, respawns it, and drives script-supplied `readiness`/`liveness` promise factories — passing every callback by reference (`resolve`, `pre_start`, `post_start`, `pre_stop`, `post_stop`, `readiness`, `liveness`). Async primitives — `go()`, `poll()`, `promise()`, `join()`, `select()` — let `main()` coordinate (seed election, ordering, multiple workloads) and react to health imperatively. Builtins also expose CloudMap discovery, the host's interface addresses, filesystem checks, HTTP/TCP/gRPC probes, ECS preconditions, and a conditional-write key/value store backed by DynamoDB.
 
@@ -18,7 +20,7 @@ def main():
 ```
 
 ```bash
-aws-service-discovery-bootstrapper \
+muster \
   -namespace my-namespace \
   -script servers.star \
   -- my-executable
@@ -28,16 +30,16 @@ aws-service-discovery-bootstrapper \
 
 ## Installation
 
-You can install the AWS ServiceDiscovery bootstrapper using `go get`:
+You can install muster using `go install`:
 
 ```bash
-go install github.com/moriyoshi/aws-service-discovery-bootstrapper@latest
+go install github.com/moriyoshi/muster@latest
 ```
 
 ## Usage
 
 ```bash
-aws-service-discovery-bootstrapper \
+muster \
   -namespace <namespace> \
   -script <path> \
   [-kv-table <name> [-kv-key-prefix <prefix>] [-kv-create-table]] \
@@ -283,18 +285,18 @@ Each workload's `name` is its `spawn(name=…)` argument (auto-assigned `workloa
 The same binary can act as a probe client with `-health-probe`, which queries the socket and maps state to an exit code (`0` = healthy, non-zero = unhealthy or unreachable). The container is reported healthy only when **every** workload is healthy — a workload with no health probe falls back to being up, and any unhealthy or down workload fails the probe. This makes it usable directly as a container healthcheck command:
 
 ```dockerfile
-ENTRYPOINT ["aws-service-discovery-bootstrapper", "-namespace", "my-namespace", \
+ENTRYPOINT ["muster", "-namespace", "my-namespace", \
             "-script", "/workload.star", \
-            "-control-socket", "/run/harness.sock", \
+            "-control-socket", "/run/muster.sock", \
             "--", "my-workload"]
-HEALTHCHECK CMD ["aws-service-discovery-bootstrapper", "-health-probe", "-control-socket", "/run/harness.sock"]
+HEALTHCHECK CMD ["muster", "-health-probe", "-control-socket", "/run/muster.sock"]
 ```
 
 The probe client uses a short timeout, so a missing socket or dead harness reports unhealthy promptly rather than hanging.
 
 ## Configuration
 
-The AWS ServiceDiscovery bootstrapper can be configured using environment variables supported by AWS SDK. The following is a non-exhaustive list of such:
+muster can be configured using environment variables supported by AWS SDK. The following is a non-exhaustive list of such:
 
 - `AWS_REGION`: The AWS region to use for service discovery. If not set, the default region from the AWS CLI configuration will be used.
 
