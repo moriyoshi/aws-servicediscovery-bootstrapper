@@ -2,8 +2,9 @@
 
 ## 2026-08-12 — Multi-cloud providers (AWS + Google Cloud)
 
-Branch `feat/multicloud-providers`, 15 commits off `4274e43`.
-Every commit leaves `go test ./...` green.
+Branch `feat/multicloud-providers` (PR #8), squashed to one commit off
+`0cac981`, plus the follow-ups merged since. Every commit leaves
+`go test ./...` green.
 
 muster was AWS-only in every cloud-facing part: CloudMap for discovery, DynamoDB
 for the kv store, the ECS task metadata endpoint for identity, ECS
@@ -19,9 +20,10 @@ import a cloud SDK:
 | Capability | AWS | Google Cloud |
 | --- | --- | --- |
 | Discovery | CloudMap `DiscoverInstances` | Service Directory `ResolveService` |
-| KV store | DynamoDB conditional writes | Cloud Storage generation preconditions |
+| KV store | DynamoDB conditional writes | Cloud Storage generation preconditions, or Firestore transactions |
 | Identity | ECS task metadata endpoint | Cloud Run env + the metadata server |
 | Replica status | ECS `RunningCount == DesiredCount` | *unsupported* — Cloud Run does not expose it |
+| Registration | *unsupported* — Service Connect does it | Service Directory `CreateEndpoint` |
 
 GCP targets **Cloud Run**. See the rescope below — the first cut targeted
 stateful managed instance groups, and GCE turned out to be out of scope.
@@ -133,37 +135,70 @@ endpoints carry no health status, so anything but `health_status="ALL"` raises
 instead of widening to "return everything" — handing a script dead peers it
 explicitly asked not to see would make it join a cluster that is not there.
 `ResolveService` truncates at 100 endpoints (logged when hit). An endpoint
-carries one address, not a v4/v6 pair. `SELF.created_at` is empty: the metadata
+carries one address, not a v4/v6 pair.
+
+**Service Directory endpoint ids are 63 characters**, `[a-z0-9-]`, starting with
+a letter — and a Cloud Run instance id is around 200 hex characters, so the
+obvious key does not fit. Endpoints are keyed on the *address* instead
+(`ip-10-128-253-19`), which is shorter than the limit, unique among live
+instances, and has the useful property that a replacement at the same address
+inherits the entry rather than adding a second one. The cost is that an instance
+does not reclaim its own entry across replacement, which was already true for a
+different reason. `SELF.created_at` is empty: the metadata
 server does not carry it, and the only source would drag in `computepb` — a
 single generated package covering the entire Compute API — for one field
 nothing reads.
 
-### Verified
+### Configuration travels as environment variables
 
-- `gofmt` clean; build + vet under every tag (default, `e2e`, `e2e_tikv`, `gcp`,
-  `gcp,gcp_live`).
-- Full suite under the default and `gcp` builds, `-race -shuffle=on`.
-- Dependency isolation asserted in both directions (see above).
-- KV conformance (13 subtests) green against `memKV` and `gcsKV`.
-- Every startup error path smoke-tested against the real binaries: absent
-  provider, nothing to autodetect, removed flag, cross-cloud autodetect,
-  unknown `-provider-opt`.
-- Starlark capability messages unchanged where they should be
-  ("kv store not configured", "ECS client not configured" → now
-  "replica status not configured").
+Every flag is also readable as `MUSTER_<FLAG>` — `-kv-store` from
+`MUSTER_KV_STORE`, and so on — with an explicitly passed flag always winning.
 
-### Not verified — needs infrastructure
+This started as a special case for `MUSTER_PROVIDER` and should not have stayed
+one. muster is a container entrypoint: the entrypoint is baked into the image
+while the configuration is per deployment, and an image whose entrypoint ends in
+`-- <workload>` cannot take extra flags by appending arguments. A platform that
+lets you set only environment and arguments then leaves no way to pass a
+setting at all.
 
-- **`-tags=e2e`** (Winterbäume emulator): compiles and vets, not run. Now runs
-  the shared conformance suite against the real DynamoDB store.
-- **`-tags=e2e_tikv`** (Terraform + Fargate TiKV): compiles and vets, not run.
-  **This is the real regression gate for the refactor** — `NoSplitBrain` and
-  `SeedLease` are what prove seed election survived. Worth running before merge.
-- **`-tags=e2e_tikv_gcp`** (Terraform + Cloud Run worker pools): compiles and
-  vets, `terraform validate` passes, never applied. Needs a project.
-- **`-tags=gcp,gcp_live`**: skips without `MUSTER_GCP_KV_BUCKET`. The fake is
-  single-process and cannot reproduce contention, retries, or the per-object
-  write rate.
+Two flags are exempt (`-health-probe`, `-provider-help`): a stray variable in
+someone's shell turning an ordinary run into a health probe or a help dump is a
+failure mode worth foreclosing. `-provider-opt` is repeatable, so its variable
+holds a comma-separated list.
+
+**The near-miss this came from, and the guard against the next one.** The Cloud
+Run stack passed `MUSTER_KV_BUCKET`, which is not what the flag is called, so
+the configuration was simply absent and PD refused to start — a failure that
+cost a full provision to discover and would have been a one-line diff to
+prevent. Now that every flag has a variable, plausible-but-wrong *names* are the
+remaining hazard, and `MUSTER_KV_BUCKET` looks exactly as reasonable as
+`MUSTER_KV_STORE`. `TestE2EStackEnvIsConsumed` walks both stacks' Terraform and
+fails on any `MUSTER_*` variable that neither muster nor a script that stack
+deploys reads. It deliberately does not check the converse: `env()` takes a
+default, and both PD scripts rely on that.
+
+### The AWS scripts had drifted, and it was the AWS ones that were stale
+
+`SELF.ipv4` was added for every provider, and the Cloud Run scripts use it. The
+AWS scripts were never converted — they still picked their address off the
+interface with `ifaddr(MUSTER_SUBNET_CIDR)`, a **required** variable carrying a
+value muster already had in the task metadata. So the two stacks disagreed about
+the most basic question either script asks, and a deployment that forgot the
+variable failed at load time for nothing.
+
+`SELF.ipv4` is now the source on both. `ifaddr()` stayed as a *fallback* rather
+than being deleted, which is a deviation from the original plan and deliberate:
+muster reads the task metadata once at startup, best-effort and without retry,
+so a transient failure leaves `SELF` empty for the life of the process, and a
+task that cannot name its own address cannot be a PD member at all. The Cloud
+Run script keeps failing outright in that case, because an empty `SELF.ipv4`
+means something different there — the workload was deployed on a service or a
+job rather than a worker pool, a deployment mistake no fallback should paper
+over.
+
+The general shape is worth keeping: two scripts differing in *what an absent
+answer means* is a platform difference; two scripts differing in where they get
+the answer is drift.
 
 ### The rescope, and what it cost
 
@@ -383,6 +418,55 @@ Verified locally rather than argued: a single-node PD plus a store under
 source line, and the same pair with the config file mounted bootstraps the
 cluster and reaches `Up`.
 
+### Verified
+
+- `gofmt` clean; build + vet under every tag (default, `e2e`, `e2e_tikv`,
+  `e2e_tikv_gcp`, `gcp`, `gcp,gcp_live`).
+- Full suite under the default and `gcp` builds, `-race -shuffle=on`.
+- Dependency isolation asserted in both directions (see above).
+- KV conformance (13 subtests) green against `memKV`, `gcsKV` and — via the
+  emulator in Docker — `firestoreKV`.
+- Every startup error path smoke-tested against the real binaries: absent
+  provider, nothing to autodetect, removed flag, cross-cloud autodetect,
+  unknown `-provider-opt`.
+- Starlark capability messages unchanged where they should be
+  ("kv store not configured", "ECS client not configured" → now
+  "replica status not configured").
+
+### What the real Cloud Run runs proved, and what they did not
+
+The Google Cloud stack **has been applied**, several times, against a real
+project. That changes the status of the most important claim in this document.
+
+**Seed election works on Cloud Run.** In production, on worker pools, from a
+cold start: one replica took the lease and bootstrapped, the other two followed
+it, all three registered themselves through `register()`, and PD reported one
+cluster id with quorum formed. Every endpoint in Service Directory got there
+through muster's own code, because nothing on Cloud Run registers an instance —
+so unlike the CloudMap side, that is a test of muster rather than of the
+platform. This is the part the whole provider exists for and it is no longer
+theoretical.
+
+**The suite has still never passed end to end**, and the reason was never the
+election. Four separate failures, each costing a provision: registry
+authentication, a configuration variable nothing read, the reporting loop's
+silent death, and TiKV's file-descriptor demand. The store tier has
+never come up, so `StoresUp` and the store half of `NoSplitBrain` remain
+unexercised, and `PDReplacementRejoins` has never run at all.
+
+Still not verified, and needing infrastructure:
+
+- **`-tags=e2e_tikv`** (Terraform + Fargate TiKV): compiles and vets, not run.
+  **This is the real regression gate for the refactor** — `NoSplitBrain` and
+  `SeedLease` are what prove seed election survived. Worth running before merge,
+  and now doubly so, since the AWS scripts changed after it last passed.
+- **`-tags=e2e`** (Winterbäume emulator): compiles and vets, not run. Now runs
+  the shared conformance suite against the real DynamoDB store.
+- **`-tags=gcp,gcp_live`**: skips without `MUSTER_GCP_KV_BUCKET`. The fake is
+  single-process and cannot reproduce contention, retries, or the per-object
+  write rate. The same gap applies to Firestore, where the emulator stands in
+  for the server whose transaction semantics are the thing under test.
+
 ### Deferred
 
 - Stale Service Directory endpoint reaping (an instance killed without teardown
@@ -392,14 +476,34 @@ cluster and reaches `Up`.
   path and GitHub remote are already `github.com/moriyoshi/muster` — but it
   disrupts open shells and editors, so it was left to be done deliberately.
 
+### Notes on the mechanics
+
+Two things that cost time and are not findings about muster:
+
+- **The branch requires signed commits.** `commit.gpgsign` was not set in this
+  repository, `gpg.format=ssh` and `user.signingkey` were, so commits were
+  simply unsigned and the PR was unmergeable. It is now set local to the repo.
+- **`docker login` normalises a path-qualified registry to its host**, which is
+  why one variable is enough for both the Artifact Registry login and the image
+  tags, and why an earlier two-variable version had one of them empty after a
+  targeted `terraform apply` that never evaluated the output.
+
 ### If you pick this up next
 
 Run `e2e/tikv/aws` first. It is the regression gate for the whole refactor —
 `NoSplitBrain` and `SeedLease` are what prove seed election survived — and a
 failure there means the provider work broke something rather than that new
-infrastructure code is wrong.
+infrastructure code is wrong. It also now carries a change of its own: `me()`
+reads `SELF.ipv4` rather than `ifaddr()`, which has not been near Fargate.
 
-Then `e2e/tikv/gcp`. Expect the ten-second shutdown budget to be the thing that
-bites: if `pre_stop` cannot evict a member inside it, the Raft group collects a
-dead member per replacement and the symptom is a slow loss of quorum rather than
-an obvious failure. `make logs-pd` and the self-reports are where that shows.
+Then `e2e/tikv/gcp`, where the next unknown is simply *the store tier*, which
+has never started. Everything past that point is unexercised. After it, expect
+the ten-second shutdown budget to be what bites: if `pre_stop` cannot evict a
+member inside it, the Raft group collects a dead member per replacement and the
+symptom is a slow loss of quorum rather than an obvious failure. `make logs-pd`
+and `make logs-tikv` are where both show.
+
+The pattern across every failure so far is worth carrying forward: none was in
+the election logic, and all four were in the space between muster and the
+platform — a registry credential, a variable name, a background task nobody
+joined, a resource limit. That space is where the remaining risk is too.
