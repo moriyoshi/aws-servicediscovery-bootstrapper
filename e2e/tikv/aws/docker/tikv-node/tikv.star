@@ -4,19 +4,33 @@
 # first region, and PD arbitrates that. What they do need is to not start until
 # PD is discoverable and answering, and to be handed the full PD endpoint list.
 
-# Starlark has no top-level `if`, so unset configuration fails at load time via
-# the `or fail(...)` idiom rather than surfacing as a confusing ifaddr() error.
-CIDR = env("MUSTER_SUBNET_CIDR") or fail("MUSTER_SUBNET_CIDR must be the CIDR of the subnet this task runs in")
+# The fallback for me(), and optional now that SELF.ipv4 is the primary source.
+CIDR = env("MUSTER_SUBNET_CIDR")
 PD_SERVICE = env("MUSTER_PD_SERVICE", "tikv-pd")
 PD_REPLICAS = int(env("MUSTER_PD_REPLICAS", "3"))
 
-DATA_DIR = "/db"
-LOCAL_STATUS = "http://127.0.0.1:20180/status"
+DATA_DIR = env("MUSTER_DATA_DIR", "/db")
+PD_PORT = 2379
+PORT = 20160
+STATUS_PORT = 20180
+LOCAL_STATUS = "http://127.0.0.1:%d/status" % STATUS_PORT
+
+
+def me():
+    """This task's own address on the VPC. See pd.star's me() for why ifaddr()
+    is a fallback rather than the source."""
+    if SELF and SELF.ipv4:
+        return SELF.ipv4
+    if CIDR:
+        return ifaddr(CIDR)
+    fail("tikv: this task's own address is unknown -- the task metadata endpoint " +
+         "told muster nothing and MUSTER_SUBNET_CIDR is unset, so there is no " +
+         "address to advertise to PD")
 
 
 def pd_addrs():
     # Sorted so a respawn produces the same argv when nothing has changed.
-    return sorted(["%s:2379" % i.ipv4 for i in instances(PD_SERVICE, health_status = "ALL") if i.ipv4])
+    return sorted(["%s:%d" % (i.ipv4, PD_PORT) for i in instances(PD_SERVICE, health_status = "ALL") if i.ipv4])
 
 
 def pd_up():
@@ -41,16 +55,16 @@ def resolve_tikv():
     if not join(poll(pd_up, "240s", interval = "5s")):
         fail("tikv: PD was not reachable within 240s")
 
-    ip = ifaddr(CIDR)
+    ip = me()
     return COMMAND + [
         "--addr",
-        "0.0.0.0:20160",
+        "0.0.0.0:%d" % PORT,
         "--advertise-addr",
-        "%s:20160" % ip,
+        "%s:%d" % (ip, PORT),
         "--status-addr",
-        "0.0.0.0:20180",
+        "0.0.0.0:%d" % STATUS_PORT,
         "--advertise-status-addr",
-        "%s:20180" % ip,
+        "%s:%d" % (ip, STATUS_PORT),
         "--data-dir",
         DATA_DIR,
         "--pd-endpoints",

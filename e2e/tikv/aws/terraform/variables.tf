@@ -16,8 +16,9 @@ variable "internal_subnet_cidr" {
     CIDR of the isolated subnet that hosts the Fargate tasks. Nothing in this
     stack is reachable from outside the VPC: there is no internet gateway and no
     load balancer, so the subnet has no route off the VPC at all and everything
-    the tasks need is reached over VPC endpoints. The muster scripts also use
-    this value with ifaddr() to pick their own address.
+    the tasks need is reached over VPC endpoints. The muster scripts also take
+    it as the fallback for their own address, for when the task metadata
+    endpoint leaves SELF.ipv4 empty.
   EOT
   default     = "172.31.255.0/24"
 }

@@ -14,9 +14,8 @@
 # must bootstrap, or the cluster splits in two. kv_put_if_absent() is the
 # arbiter — it is a conditional write, so exactly one caller can win.
 
-# Starlark has no top-level `if`, so unset configuration fails at load time via
-# the `or fail(...)` idiom rather than surfacing as a confusing ifaddr() error.
-CIDR = env("MUSTER_SUBNET_CIDR") or fail("MUSTER_SUBNET_CIDR must be the CIDR of the subnet this task runs in")
+# The fallback for me(), and optional now that SELF.ipv4 is the primary source.
+CIDR = env("MUSTER_SUBNET_CIDR")
 PD_SERVICE = env("MUSTER_PD_SERVICE", "tikv-pd")
 
 # Our own replica-set coordinates, for all_replicas_running(). Left unset these
@@ -28,8 +27,10 @@ PD_SERVICE = env("MUSTER_PD_SERVICE", "tikv-pd")
 SELF_GROUP = env("MUSTER_SELF_GROUP")
 SELF_SERVICE = env("MUSTER_SELF_SERVICE")
 
-DATA_DIR = "/pd"
+DATA_DIR = env("MUSTER_DATA_DIR", "/pd")
 SEED_KEY = "tikv-pd/seed"
+CLIENT_PORT = 2379
+PEER_PORT = 2380
 
 # The lease is only held across a cold start. It is released in pre_stop, and
 # expires on its own if the winner dies before it can bootstrap.
@@ -41,19 +42,37 @@ SEED_TTL = "180s"
 # and no store exists until this service is already up. The cold-start sequence
 # below already relies on that being true: live_peers() and await_seed() use the
 # same endpoint to decide a peer is serving.
-LOCAL_MEMBERS = "http://127.0.0.1:2379/pd/api/v1/members"
+LOCAL_MEMBERS = "http://127.0.0.1:%d/pd/api/v1/members" % CLIENT_PORT
 
 
 def me():
-    return ifaddr(CIDR)
+    """This task's own address on the VPC.
+
+    SELF.ipv4 is what ECS put in the task metadata, and is the same source the
+    Cloud Run script uses -- so the two agree on the common path.
+
+    ifaddr() stands behind it rather than replacing it because muster reads that
+    metadata once at startup, best-effort and without retry, and a task that
+    cannot name its own address cannot be a PD member at all. The Cloud Run
+    script has no such fallback and fails outright, because an empty SELF.ipv4
+    means something different there: the workload was deployed on a service or a
+    job instead of a worker pool, which no fallback should paper over.
+    """
+    if SELF and SELF.ipv4:
+        return SELF.ipv4
+    if CIDR:
+        return ifaddr(CIDR)
+    fail("pd: this task's own address is unknown -- the task metadata endpoint " +
+         "told muster nothing and MUSTER_SUBNET_CIDR is unset, so there is no " +
+         "address to advertise to peers")
 
 
 def client_url(ip):
-    return "http://%s:2379" % ip
+    return "http://%s:%d" % (ip, CLIENT_PORT)
 
 
 def peer_url(ip):
-    return "http://%s:2380" % ip
+    return "http://%s:%d" % (ip, PEER_PORT)
 
 
 def member_name(ip):
@@ -146,11 +165,11 @@ def resolve_pd():
         "--data-dir",
         DATA_DIR,
         "--client-urls",
-        "http://0.0.0.0:2379",
+        "http://0.0.0.0:%d" % CLIENT_PORT,
         "--advertise-client-urls",
         client_url(ip),
         "--peer-urls",
-        "http://0.0.0.0:2380",
+        "http://0.0.0.0:%d" % PEER_PORT,
         "--advertise-peer-urls",
         peer_url(ip),
     ]
