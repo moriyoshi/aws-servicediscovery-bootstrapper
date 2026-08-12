@@ -4,7 +4,7 @@
 # the repository root, so the image always carries the working tree's muster
 # rather than a published release.
 
-ARG GO_VERSION=1.25
+ARG GO_VERSION=1.26
 
 FROM --platform=${BUILDPLATFORM} public.ecr.aws/docker/library/golang:${GO_VERSION}-bookworm AS build
 ARG TARGETOS
