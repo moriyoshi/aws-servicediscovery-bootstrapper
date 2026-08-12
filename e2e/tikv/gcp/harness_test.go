@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moriyoshi/muster/e2e/internal/cloudrun"
 	"github.com/moriyoshi/muster/e2e/internal/harness"
 )
 
@@ -123,30 +124,22 @@ func (s *stack) gcloudJSON(ctx context.Context, into any, args ...string) error 
 
 // --- the pools -------------------------------------------------------------
 
-// poolReady reports whether a pool has reconciled onto a ready revision. A
-// worker pool serves no requests, so this is the only signal that its instances
-// were started rather than merely asked for.
+// poolReady reports whether a pool has reconciled onto a ready revision.
+//
+// The parsing lives in e2e/internal/cloudrun so that it can be tested without a
+// project, which is the whole reason this was broken: it read the Cloud Run v2
+// API's field names -- terminalCondition.state, the spelling the Terraform
+// provider uses -- out of gcloud's output, which is Knative-shaped. Those keys
+// are simply absent there, so the struct stayed zero and the check reported
+// "condition  is :" while waiting out its full fifteen minutes on two pools
+// that had been ready for most of it.
 func (s *stack) poolReady(ctx context.Context, pool string) error {
-	var p struct {
-		TerminalCondition struct {
-			Type    string `json:"type"`
-			State   string `json:"state"`
-			Message string `json:"message"`
-		} `json:"terminalCondition"`
-		Reconciling bool `json:"reconciling"`
-	}
-	if err := s.gcloudJSON(ctx, &p, "beta", "run", "worker-pools", "describe", pool,
-		"--region="+s.region); err != nil {
+	out, err := s.gcloud(ctx, "beta", "run", "worker-pools", "describe", pool,
+		"--region="+s.region, "--format=json")
+	if err != nil {
 		return err
 	}
-	if p.Reconciling {
-		return fmt.Errorf("%s is still reconciling", pool)
-	}
-	if p.TerminalCondition.State != "CONDITION_SUCCEEDED" {
-		return fmt.Errorf("%s condition %s is %s: %s",
-			pool, p.TerminalCondition.Type, p.TerminalCondition.State, p.TerminalCondition.Message)
-	}
-	return nil
+	return cloudrun.PoolReady(pool, []byte(out))
 }
 
 // --- logs, which are how the cluster is observed ---------------------------

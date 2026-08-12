@@ -418,6 +418,34 @@ Verified locally rather than argued: a single-node PD plus a store under
 source line, and the same pair with the config file mounted bootstraps the
 cluster and reaches `Up`.
 
+### The readiness check that read the wrong API
+
+`PoolsReachReady` waited out its full fifteen minutes on two worker pools that
+had been ready for most of it, reporting `condition  is :` — two empty fields
+where the answer belonged.
+
+`gcloud run` renders Cloud Run resources in the **Knative** shape:
+`apiVersion`/`kind`/`metadata`/`spec`/`status`, with `status.conditions[]`
+carrying `type` and `status`. The check read the **v2 API's** shape instead —
+a flat `terminalCondition` whose `state` is `CONDITION_SUCCEEDED`. That is the
+spelling the Terraform provider stores, which is where it came from, and against
+gcloud's output those keys do not exist at all. So `encoding/json` filled in
+nothing, the state never equalled `CONDITION_SUCCEEDED`, and the poll could
+never succeed.
+
+The wrong field names are the shallow half. The real defect is that a check
+which cannot find the field it needs reported an empty value rather than a
+mismatch — and an empty value reads as a workload problem, so it sends you to
+the pods' logs instead of to the checker. It now says so explicitly, and that
+branch is the case the test exists for.
+
+The parsing moved to `e2e/internal/cloudrun` for one reason: at its old address,
+inside a build-tagged harness that needs a real project, it could not be tested
+at all. It now has fixtures — real captured output, the v2 shape it used to
+misread, a failed revision, a mid-reconcile pool, and a pool whose newest
+revision never became the ready one, which is what `PDReplacementRejoins`
+depends on noticing. The fix was also run against the live pools before landing.
+
 ### Verified
 
 - `gofmt` clean; build + vet under every tag (default, `e2e`, `e2e_tikv`,
