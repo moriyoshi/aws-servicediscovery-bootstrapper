@@ -446,6 +446,44 @@ misread, a failed revision, a mid-reconcile pool, and a pool whose newest
 revision never became the ready one, which is what `PDReplacementRejoins`
 depends on noticing. The fix was also run against the live pools before landing.
 
+### Three ways to read a log and find nothing
+
+`PDClusterBootstrapped` sat for its full twenty minutes reporting that no
+replica had reported a cluster, while three replicas were reporting one every
+fifteen seconds. Three separate defects, stacked, and every one of them failed
+by returning an empty result rather than an error.
+
+1. **The filter named `resource.type=cloud_run_worker`.** The type is
+   `cloud_run_worker_pool`. Cloud Logging answers an unknown resource type with
+   an empty result set, not a complaint, so the query was simply always empty.
+2. **The output was read as `value(textPayload)`.** muster logs structured JSON
+   on stdout, which the logging agent parses into `jsonPayload`; `textPayload`
+   carries only what the workload itself printed. So even with the right filter,
+   every line muster wrote came back blank — and `dumpLogs`, the thing you reach
+   for when a run fails, was blind to muster in exactly the same way.
+3. **`--order=asc` with `--limit=4000` truncates at the wrong end.** PD emits
+   thousands of lines an hour, so a limit is unavoidable and ascending order
+   spends it on the oldest entries in the window. The first read against a live
+   cluster returned four thousand entries from half past eight that morning,
+   containing no self-reports at all. Newest-first, and `LatestReports` picks by
+   timestamp rather than trusting the order it was handed.
+
+Fixing those exposed a fourth, which would have failed `NoSplitBrain` on a
+healthy cluster. **A pool's logs outlive its instances.** An hour-wide window
+holds replicas from revisions that no longer exist, and those reported a
+different cluster id — which is exactly what the split-brain check is looking
+for. Read unscoped, the live pool offered five replicas and two clusters; scoped
+to the revision the pool has settled on, three and one. Assertions now scope;
+the failure dump deliberately does not, because there you want everything.
+
+The through-line is the same as the readiness check that preceded it: every
+failure here was a *silent empty result*, and the fix is only incidentally the
+right field names. What actually changed is that this parsing now lives in
+`e2e/internal/cloudrun` with a captured log entry as a fixture, so the resource
+type, the revision label and both payload shapes are pinned against real data
+instead of against my memory of an API. Verified against the live cluster as
+well: three replicas, one cluster id, from the current revision only.
+
 ### Verified
 
 - `gofmt` clean; build + vet under every tag (default, `e2e`, `e2e_tikv`,

@@ -134,12 +134,17 @@ func (s *stack) gcloudJSON(ctx context.Context, into any, args ...string) error 
 // "condition  is :" while waiting out its full fifteen minutes on two pools
 // that had been ready for most of it.
 func (s *stack) poolReady(ctx context.Context, pool string) error {
-	out, err := s.gcloud(ctx, "beta", "run", "worker-pools", "describe", pool,
-		"--region="+s.region, "--format=json")
+	raw, err := s.describePool(ctx, pool)
 	if err != nil {
 		return err
 	}
-	return cloudrun.PoolReady(pool, []byte(out))
+	return cloudrun.PoolReady(pool, raw)
+}
+
+func (s *stack) describePool(ctx context.Context, pool string) ([]byte, error) {
+	out, err := s.gcloud(ctx, "beta", "run", "worker-pools", "describe", pool,
+		"--region="+s.region, "--format=json")
+	return []byte(out), err
 }
 
 // --- logs, which are how the cluster is observed ---------------------------
@@ -153,62 +158,79 @@ func (s *stack) poolReady(ctx context.Context, pool string) error {
 // could never see two clusters; asking every replica about itself is exactly
 // what the ECS suite achieves by shelling into each task.
 
-// report is one line of a replica's self-report, as muster logged it.
-type report struct {
-	Msg  string `json:"msg"`
-	Who  string `json:"who"`
-	Body string `json:"body"`
-}
-
-func (s *stack) logLines(ctx context.Context, pool string, freshness time.Duration, limit int) ([]string, error) {
-	filter := fmt.Sprintf(
-		`resource.type=cloud_run_worker AND resource.labels.worker_pool_name=%q`, pool)
+// logEntries reads a pool's Cloud Logging entries, newest last.
+//
+// Two things here were wrong at once, and both failed by returning nothing
+// rather than by erroring. The filter named resource type `cloud_run_worker`,
+// which does not exist — Cloud Logging answers an unknown type with an empty
+// result set, not a complaint. And the output was read as `value(textPayload)`,
+// which is empty for every line muster writes: muster logs structured JSON, the
+// agent parses it into jsonPayload, and textPayload carries only what the
+// workload itself printed. So the self-reports the whole suite reads back were
+// unreachable twice over, and `PDClusterBootstrapped` sat for its full twenty
+// minutes saying no replica had reported a cluster while three of them were.
+//
+// The parsing lives in e2e/internal/cloudrun, where a captured entry pins the
+// resource type and the two payload shapes against real data. It could not be
+// tested here.
+// An empty revision reads every revision's entries, which is what a failure dump
+// wants and what an assertion must not have.
+func (s *stack) logEntries(ctx context.Context, pool, revision string, freshness time.Duration, limit int) ([]cloudrun.LogEntry, error) {
+	filter := fmt.Sprintf(`resource.type=%q AND resource.labels.worker_pool_name=%q`,
+		cloudrun.WorkerPoolResourceType, pool)
+	if revision != "" {
+		filter += fmt.Sprintf(" AND resource.labels.%s=%q", cloudrun.RevisionLabel, revision)
+	}
 	out, err := s.gcloud(ctx, "logging", "read", filter,
-		"--order=asc",
+		// Newest first, and the limit is the reason. PD is loud -- thousands of
+		// lines an hour -- so `--limit` truncates any useful window, and
+		// ascending order truncates it at the wrong end: the first read of a
+		// live cluster came back with four thousand entries from half past
+		// eight in the morning and not one self-report in them.
+		"--order=desc",
 		fmt.Sprintf("--freshness=%dm", int(freshness.Minutes())),
 		fmt.Sprintf("--limit=%d", limit),
-		"--format=value(textPayload)")
+		"--format=json")
 	if err != nil {
 		return nil, err
 	}
-	var lines []string
-	for _, l := range strings.Split(out, "\n") {
-		if l = strings.TrimSpace(l); l != "" {
-			lines = append(lines, l)
-		}
-	}
-	return lines, nil
+	return cloudrun.ParseEntries([]byte(out))
 }
 
-// latestReports returns the most recent record of the given kind per replica.
-// Latest, not first: a replica's early reports are of a cluster still forming,
-// and asserting on those would be asserting on a moment rather than a state.
-func (s *stack) latestReports(ctx context.Context, pool, msg string) (map[string]report, error) {
-	lines, err := s.logLines(ctx, pool, 60*time.Minute, 4000)
+// latestReports returns the most recent record of the given kind per replica of
+// the revision the pool has settled on.
+//
+// Scoping to that revision is not tidiness. A pool's logs outlive its
+// instances, so an hour-wide window holds replicas from revisions that no
+// longer exist -- and those reported a different cluster id, which is precisely
+// what NoSplitBrain is looking for. Read without the scope, a healthy pool
+// reports five replicas and two clusters.
+func (s *stack) latestReports(ctx context.Context, pool, msg string) (map[string]cloudrun.Report, error) {
+	raw, err := s.describePool(ctx, pool)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]report{}
-	for _, line := range lines {
-		var r report
-		if json.Unmarshal([]byte(line), &r) != nil || r.Msg != msg {
-			continue
-		}
-		out[r.Who] = r // ascending order, so the last write wins
+	revision, err := cloudrun.ReadyRevision(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", pool, err)
 	}
-	return out, nil
+	entries, err := s.logEntries(ctx, pool, revision, 60*time.Minute, 4000)
+	if err != nil {
+		return nil, err
+	}
+	return cloudrun.LatestReports(entries, msg), nil
 }
 
 func (s *stack) dumpLogs(t *testing.T, pool string, limit int) {
 	t.Helper()
-	lines, err := s.logLines(context.Background(), pool, 60*time.Minute, limit)
+	entries, err := s.logEntries(context.Background(), pool, "", 60*time.Minute, limit)
 	if err != nil {
 		t.Logf("could not read logs for %s: %v", pool, err)
 		return
 	}
 	t.Logf("--- last %d log lines for %s ---", limit, pool)
-	for _, l := range lines {
-		t.Logf("  | %s", l)
+	for _, e := range entries {
+		t.Logf("  | %s", e)
 	}
 }
 

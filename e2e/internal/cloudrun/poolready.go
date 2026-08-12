@@ -35,6 +35,22 @@ type pool struct {
 	} `json:"status"`
 }
 
+// ReadyRevision names the revision a pool has settled on, given the same
+// describe output. Assertions scope their log reads to it: a worker pool's logs
+// outlive the instances that wrote them, so a window wide enough to be useful
+// also contains replicas from revisions that are gone. Their reports describe a
+// different cluster, and counting them turns a healthy pool into a split brain.
+func ReadyRevision(raw []byte) (string, error) {
+	var p pool
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return "", fmt.Errorf("parsing describe output: %w", err)
+	}
+	if p.Status.LatestReady == "" {
+		return "", fmt.Errorf("no ready revision in the describe output")
+	}
+	return p.Status.LatestReady, nil
+}
+
 // PoolReady reports whether a worker pool has reconciled onto a ready revision,
 // given the JSON `gcloud run worker-pools describe` produced for it. A worker
 // pool serves no requests, so this is the only signal that its instances were

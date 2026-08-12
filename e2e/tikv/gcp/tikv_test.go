@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moriyoshi/muster/e2e/internal/cloudrun"
 	"github.com/moriyoshi/muster/e2e/internal/harness"
 )
 
@@ -247,21 +248,27 @@ func TestTiKVOnCloudRun(t *testing.T) {
 
 		harness.Eventually(t, "the same cluster came back", 20*time.Minute, 20*time.Second,
 			func(ctx context.Context) error {
-				lines, err := s.logLines(ctx, s.pdPool, time.Since(rolled)+2*time.Minute, 4000)
+				// The revision the roll produced, so the replicas that were
+				// replaced cannot answer for the ones that replaced them.
+				raw, err := s.describePool(ctx, s.pdPool)
+				if err != nil {
+					return err
+				}
+				revision, err := cloudrun.ReadyRevision(raw)
+				if err != nil {
+					return err
+				}
+				entries, err := s.logEntries(ctx, s.pdPool, revision, time.Since(rolled)+2*time.Minute, 4000)
 				if err != nil {
 					return err
 				}
 				seen := map[string]int64{}
-				for _, line := range lines {
-					var r report
-					if json.Unmarshal([]byte(line), &r) != nil || r.Msg != "pd: CLUSTER" {
-						continue
-					}
+				for who, r := range cloudrun.LatestReports(entries, "pd: CLUSTER") {
 					var info pdClusterInfo
 					if json.Unmarshal([]byte(r.Body), &info) != nil {
 						continue
 					}
-					seen[r.Who] = info.ID
+					seen[who] = info.ID
 				}
 				if len(seen) < s.pdWant {
 					return fmt.Errorf("%d of %d replacements have reported", len(seen), s.pdWant)
