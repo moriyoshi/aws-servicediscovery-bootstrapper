@@ -6,11 +6,13 @@ import (
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
+
+	"github.com/moriyoshi/muster/internal/provider"
 )
 
 // entryToStarlark converts a discovered instance into a Starlark struct with
 // .ipv4 / .ipv6 / .port fields.
-func entryToStarlark(e entry) starlark.Value {
+func entryToStarlark(e provider.Instance) starlark.Value {
 	return starlarkstruct.FromStringDict(starlarkstruct.Default, starlark.StringDict{
 		"ipv4": starlark.String(e.IPv4Addr),
 		"ipv6": starlark.String(e.IPv6Addr),
@@ -18,7 +20,7 @@ func entryToStarlark(e entry) starlark.Value {
 	})
 }
 
-func entriesToStarlark(es []entry) *starlark.List {
+func entriesToStarlark(es []provider.Instance) *starlark.List {
 	vals := make([]starlark.Value, len(es))
 	for i, e := range es {
 		vals[i] = entryToStarlark(e)
@@ -26,21 +28,40 @@ func entriesToStarlark(es []entry) *starlark.List {
 	return starlark.NewList(vals)
 }
 
-// taskMetaToStarlark exposes the ECS task metadata as the TASK global struct.
-func taskMetaToStarlark(m *taskMetadataV4) starlark.Value {
+// selfToStarlark exposes the instance identity as the SELF global struct.
+//
+// Absent identity stays None rather than becoming a struct of empty strings: a
+// starlarkstruct is always truthy, so an `if SELF:` guard would silently become
+// dead code.
+//
+// Provider-specific fields hang off a sub-struct named for the provider
+// (SELF.aws.vpc_id), so reading one on a build for another cloud raises "struct
+// has no .aws attribute" instead of returning something plausible. Anything
+// under that name is a visible declaration that the script is not portable.
+func selfToStarlark(m *provider.Identity) starlark.Value {
 	if m == nil {
 		return starlark.None
 	}
-	return starlarkstruct.FromStringDict(starlarkstruct.Default, starlark.StringDict{
-		"cluster":           starlark.String(m.Cluster),
-		"service_name":      starlark.String(m.ServiceName),
-		"task_arn":          starlark.String(m.TaskARN),
-		"family":            starlark.String(m.Family),
-		"revision":          starlark.String(m.Revision),
-		"vpc_id":            starlark.String(m.VPCID),
-		"availability_zone": starlark.String(m.AvailabilityZone),
-		"created_at":        starlark.String(m.CreatedAt),
-	})
+	fields := starlark.StringDict{
+		"id":         starlark.String(m.ID),
+		"name":       starlark.String(m.Name),
+		"group":      starlark.String(m.Group),
+		"service":    starlark.String(m.Service),
+		"zone":       starlark.String(m.Zone),
+		"region":     starlark.String(m.Region),
+		"network":    starlark.String(m.Network),
+		"ipv4":       starlark.String(m.IPv4),
+		"ipv6":       starlark.String(m.IPv6),
+		"created_at": starlark.String(m.CreatedAt),
+	}
+	if len(m.Extra) > 0 && m.Provider != "" {
+		extra := make(starlark.StringDict, len(m.Extra))
+		for k, v := range m.Extra {
+			extra[k] = starlark.String(v)
+		}
+		fields[m.Provider] = starlarkstruct.FromStringDict(starlarkstruct.Default, extra)
+	}
+	return starlarkstruct.FromStringDict(starlarkstruct.Default, fields)
 }
 
 func stringsToStarlark(ss []string) *starlark.List {

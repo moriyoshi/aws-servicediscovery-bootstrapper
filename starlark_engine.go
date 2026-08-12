@@ -6,8 +6,11 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 
 	"go.starlark.net/starlark"
+
+	"github.com/moriyoshi/muster/internal/provider"
 )
 
 // engineDeps carries everything the Starlark builtins need at call time. It is
@@ -15,11 +18,24 @@ import (
 // ifMu-guarded ifCache. Module globals are frozen after load, so concurrent
 // starlark.Call across threads is safe.
 type engineDeps struct {
-	logger   *slog.Logger
-	sd       *serviceDiscovery
-	kv       kvStore
-	ecs      ecsDescriber
-	meta     *taskMetadataV4
+	logger *slog.Logger
+
+	// Provider capabilities, each carrying the reason it is unavailable so the
+	// builtin that needs one can say why (see optional).
+	disc  optional[provider.Discoverer]
+	kv    optional[provider.KVStore]
+	fleet optional[provider.Fleet]
+	reg   optional[provider.Registrar]
+
+	// self is the identity of the instance muster runs on, or nil when the
+	// platform did not tell us. It backs the SELF global and defaults the
+	// target of all_replicas_running().
+	self *provider.Identity
+
+	// provider is the selected provider's name, exposed as PROVIDER. It is set
+	// even when self is nil.
+	provider string
+
 	command  []string
 	allowRun bool
 
@@ -36,7 +52,16 @@ type engine struct {
 	deps    *engineDeps
 	globals starlark.StringDict
 	main    *starlark.Function
+
+	// unobservedGrace is how long a rejected task is given for someone to join
+	// it before the failure is reported as unobserved. Overridden in tests.
+	unobservedGrace time.Duration
 }
+
+// defaultUnobservedGrace is long enough that a task rejecting just before its
+// joiner reaches join() is not reported, and short enough that a genuinely
+// dropped failure appears while it still explains what follows.
+const defaultUnobservedGrace = 5 * time.Second
 
 // loadScript compiles and evaluates the script at path and extracts main().
 func loadScript(ctx context.Context, path string, deps *engineDeps) (*engine, error) {
@@ -109,11 +134,45 @@ func (e *engine) spawnFunc(ctx context.Context, name string, run func(context.Co
 				return
 			}
 			p.reject(err)
+			e.reportIfUnobserved(p, err)
 			return
 		}
 		p.resolve(v)
 	}()
 	return p
+}
+
+// reportIfUnobserved logs a task failure that nothing is going to join.
+//
+// A rejected promise is inert: it holds the error until someone asks, and if
+// nobody ever does, the error is simply gone. That is right for a probe raced
+// by any_true() and wrong for a background task, and the difference is invisible
+// from here -- so this waits a moment for a joiner and reports what is left.
+//
+// This exists because of a real failure. A script started a reporting loop with
+// go(report) and never joined it; the first HTTP request in the loop ran before
+// the workload was listening, http_request raised on the refused connection, and
+// the task died on its first iteration. Nothing was logged, the workload was
+// healthy, and the loop's total silence was indistinguishable from a loop that
+// had nothing to say. It cost a full cloud provision to find.
+//
+// A joined promise reports through its joiner, so staying quiet in that case is
+// what keeps this from double-reporting every ordinary error.
+func (e *engine) reportIfUnobserved(p *promise, err error) {
+	grace := e.unobservedGrace
+	if grace <= 0 {
+		grace = defaultUnobservedGrace
+	}
+	go func() {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		<-timer.C
+		if p.awaited.Load() {
+			return
+		}
+		e.deps.logger.Warn("task failed and nothing joined it; its error would "+
+			"otherwise be lost", "task", p.name, "err", err)
+	}()
 }
 
 // spawnTask is spawnFunc for a Starlark callable (the go() builtin).

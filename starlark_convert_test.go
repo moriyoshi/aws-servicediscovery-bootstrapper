@@ -6,6 +6,8 @@ import (
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
+
+	"github.com/moriyoshi/muster/internal/provider"
 )
 
 func TestUnpackDuration(t *testing.T) {
@@ -56,7 +58,7 @@ func TestStarlarkDictToEnv(t *testing.T) {
 }
 
 func TestEntryToStarlark(t *testing.T) {
-	v := entryToStarlark(entry{IPv4Addr: "10.0.0.1", IPv6Addr: "::1", Port: 2379})
+	v := entryToStarlark(provider.Instance{IPv4Addr: "10.0.0.1", IPv6Addr: "::1", Port: 2379})
 	s, ok := v.(*starlarkstruct.Struct)
 	if !ok {
 		t.Fatalf("not a struct: %T", v)
@@ -74,14 +76,61 @@ func TestEntryToStarlark(t *testing.T) {
 	}
 }
 
-func TestTaskMetaToStarlark(t *testing.T) {
-	m := &taskMetadataV4{Cluster: "c", ServiceName: "svc", AvailabilityZone: "us-east-1a", TaskARN: "arn"}
-	s := taskMetaToStarlark(m).(*starlarkstruct.Struct)
-	az, _ := s.Attr("availability_zone")
-	if az.(starlark.String) != "us-east-1a" {
-		t.Fatalf("az=%v", az)
+func TestSelfToStarlark(t *testing.T) {
+	m := &provider.Identity{
+		Provider:  "aws",
+		ID:        "arn",
+		Group:     "c",
+		Service:   "svc",
+		Zone:      "us-east-1a",
+		Region:    "us-east-1",
+		Network:   "vpc-1",
+		IPv4:      "10.0.2.106",
+		CreatedAt: "2026-08-11T15:00:00Z",
+		Extra:     map[string]string{"family": "fam", "revision": "7"},
 	}
-	if taskMetaToStarlark(nil) != starlark.None {
-		t.Fatal("nil metadata should map to None")
+	s := selfToStarlark(m).(*starlarkstruct.Struct)
+	for field, want := range map[string]string{
+		"id":         "arn",
+		"name":       "",
+		"group":      "c",
+		"service":    "svc",
+		"zone":       "us-east-1a",
+		"region":     "us-east-1",
+		"network":    "vpc-1",
+		"ipv4":       "10.0.2.106",
+		"ipv6":       "",
+		"created_at": "2026-08-11T15:00:00Z",
+	} {
+		got, err := s.Attr(field)
+		if err != nil {
+			t.Errorf("%s: %v", field, err)
+			continue
+		}
+		if string(got.(starlark.String)) != want {
+			t.Errorf("%s = %v, want %q", field, got, want)
+		}
+	}
+
+	// Provider-specific fields hang off a sub-struct named for the provider, so
+	// a script that reads one is visibly not portable.
+	sub, err := s.Attr("aws")
+	if err != nil {
+		t.Fatalf("SELF.aws: %v", err)
+	}
+	family, err := sub.(*starlarkstruct.Struct).Attr("family")
+	if err != nil || string(family.(starlark.String)) != "fam" {
+		t.Fatalf("SELF.aws.family = %v, err %v", family, err)
+	}
+	// Reading it on a build for another cloud has to fail loudly rather than
+	// return something plausible.
+	if _, err := s.Attr("gcp"); err == nil {
+		t.Fatal("SELF.gcp should not exist on an aws identity")
+	}
+
+	// Scripts guard with `if SELF:`, so absent identity has to stay None: a
+	// struct of empty strings would be truthy and silently kill the guard.
+	if selfToStarlark(nil) != starlark.None {
+		t.Fatal("nil identity should map to None")
 	}
 }

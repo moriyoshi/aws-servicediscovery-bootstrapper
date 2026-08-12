@@ -8,6 +8,16 @@ import (
 	"go.starlark.net/starlark"
 )
 
+// markAwaited records that the script has looked at these outcomes, so a
+// rejection among them is not reported as one nobody heard about. select() and
+// any_true() read doneCh directly rather than through await(), so they have to
+// say so themselves.
+func markAwaited(ps []*promise) {
+	for _, p := range ps {
+		p.awaited.Store(true)
+	}
+}
+
 // addAsyncBuiltins registers the Promise primitives: go(), poll(), promise(),
 // join(), select().
 func addAsyncBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) {
@@ -118,6 +128,7 @@ func addAsyncBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDep
 		if err != nil {
 			return nil, err
 		}
+		markAwaited(ps)
 		ctx := ctxOf(t)
 		cases := make([]reflect.SelectCase, 0, len(ps)+1)
 		for _, p := range ps {
@@ -144,6 +155,7 @@ func addAsyncBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDep
 		if err != nil {
 			return nil, err
 		}
+		markAwaited(ps)
 		ctx := ctxOf(t)
 		cancelRest := func() {
 			for _, p := range ps {
