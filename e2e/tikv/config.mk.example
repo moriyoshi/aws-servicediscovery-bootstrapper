@@ -1,0 +1,18 @@
+# Copy to config.mk and adjust. Every value here has a working default; this
+# file exists so you can pin them without exporting environment variables.
+
+# Left unset, the region comes from your AWS_PROFILE / ~/.aws/config, the same
+# way the AWS CLI resolves it. Set it only to override that.
+# AWS_REGION=ap-northeast-1
+
+# Read from the Terraform state (the `ecr_registry` output) once `make bootstrap`
+# has created the repositories. Set it only to push somewhere else.
+# DOCKER_REGISTRY=123456789012.dkr.ecr.ap-northeast-1.amazonaws.com
+
+# Prefix on every resource name, so two stacks can share an account.
+# NAME_PREFIX=muster-e2e-tikv-
+
+# TIKV_VERSION=v8.5.1
+
+# PD_DESIRED_COUNT=3
+# TIKV_DESIRED_COUNT=3

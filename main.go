@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -130,10 +131,30 @@ type taskMetadataV4 struct {
 	CreatedAt        string `json:"CreatedAt"`
 }
 
+// metadataURIEnv lists, in preference order, the environment variables ECS uses
+// to advertise the task metadata endpoint. The name is ECS_-prefixed: the
+// AWS_CONTAINER_* variables are the credentials ones, and nothing ever sets
+// AWS_CONTAINER_METADATA_URI_V4 — reading it meant metadata was silently
+// unavailable on every ECS task, taking TASK and the no-argument form of
+// all_ecs_tasks_running() down with it.
+var metadataURIEnv = []string{
+	"ECS_CONTAINER_METADATA_URI_V4", // Fargate platform 1.4.0+, EC2 agent 1.39+
+	"ECS_CONTAINER_METADATA_URI",    // v3, for older agents
+}
+
+func metadataURI() string {
+	for _, name := range metadataURIEnv {
+		if uri := os.Getenv(name); uri != "" {
+			return uri
+		}
+	}
+	return ""
+}
+
 func fetchContainerMetadata(ctx context.Context) (*taskMetadataV4, error) {
-	uri := os.Getenv("AWS_CONTAINER_METADATA_URI_V4")
+	uri := metadataURI()
 	if uri == "" {
-		return nil, fmt.Errorf("AWS_CONTAINER_METADATA_URI_V4 environment variable is not set")
+		return nil, fmt.Errorf("none of %s is set; not running under ECS?", strings.Join(metadataURIEnv, ", "))
 	}
 	req, err := http.NewRequest(http.MethodGet, uri+"/task", nil)
 	if err != nil {

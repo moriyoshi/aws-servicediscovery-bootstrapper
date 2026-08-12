@@ -1,0 +1,8 @@
+# The build context is the repository root; keep state and VCS metadata out of
+# it so an unrelated `terraform apply` does not bust the build cache.
+.git
+.github
+e2e/tikv/terraform/.terraform
+e2e/tikv/terraform/terraform.tfstate*
+e2e/tikv/config.mk
+*.test

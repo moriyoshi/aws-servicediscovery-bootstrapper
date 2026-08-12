@@ -153,6 +153,8 @@ Optional functions returning a **promise** (see below), called by `spawn()` per 
 <dd>
 
 `respawn=False`, `keep_alive=False`, `max_retries=5` (0 = unlimited), `initial_interval="1s"`, `max_interval="60s"`, `multiplier=2.0`, `reset_after="30s"`, `shutdown_grace="10s"`, `pre_stop_timeout=0`, `resolve_timeout=0`, `resolve_failure="retry"`, `restart_on_liveness=True`. With `respawn=True`, a non-zero exit restarts with jittered exponential backoff up to `max_retries`; `keep_alive=True` also restarts a clean exit; the counter resets after the workload stays up `reset_after`.
+
+> **Under an orchestrator, prefer a bounded `max_retries`.** `max_retries=0` is right for a bare process supervisor, but on ECS or Kubernetes the scheduler is itself the outer retry loop, and retrying forever keeps that loop from ever running. A `resolve()` that cannot succeed — a denied API call, peers that never appear — then leaves the container up as PID 1 having never started its workload, which reads as a hang rather than a failure: the task stays `RUNNING`, and nothing acts on it until a health check's grace period expires. Exhausting the retries instead exits non-zero, so the scheduler replaces the task and a persistent fault surfaces promptly. `reset_after` clears the counter once an attempt actually stays up, so a bound only fires on consecutive failures.
 </dd>
 </dl>
 
@@ -174,7 +176,7 @@ Every promise has `p.done()`. **Cancellable** promises (`go`/`poll`) add `p.canc
 ### Globals
 
 - `COMMAND`: the trailing `--` command as a list of strings.
-- `TASK`: ECS task metadata struct with `.cluster`, `.service_name`, `.task_arn`, `.availability_zone`, `.created_at`, `.family`, `.revision`, `.vpc_id` (or `None` outside ECS).
+- `TASK`: ECS task metadata struct with `.cluster`, `.service_name`, `.task_arn`, `.availability_zone`, `.created_at`, `.family`, `.revision`, `.vpc_id` (or `None` outside ECS). Read once at startup from `ECS_CONTAINER_METADATA_URI_V4`. Individual fields can be empty even inside ECS — notably `.vpc_id`, which AWS only populates for tasks on EC2 container instances, not on Fargate.
 
 ### Builtins
 
@@ -250,8 +252,12 @@ def on_stop():
 
 def main():
     return spawn(resolve=resolver, liveness=liveness, pre_stop=on_stop,
-                 respawn=True, max_retries=0)   # keep restarting; liveness loss → restart
+                 respawn=True, max_retries=5)   # bounded: give up → ECS replaces the task
 ```
+
+A worked version of this — three PD replicas and three TiKV stores, with the
+seed election exercised against a real cold start — is in
+[`e2e/tikv`](e2e/tikv).
 
 ### Migrating
 
@@ -325,3 +331,20 @@ winterbaume-server &   # or any DynamoDB-compatible endpoint
 AWS_ENDPOINT_URL=http://127.0.0.1:8080 AWS_REGION=us-east-1 \
   go test -tags=e2e -run E2E ./...
 ```
+
+A second, heavier end-to-end suite in [`e2e/tikv`](e2e/tikv) runs a real TiKV
+cluster — three PD replicas and three stores, all Fargate tasks with muster as
+the entrypoint — on a throwaway ECS cluster it provisions with Terraform. It is
+the only test that can see a split brain: it asks every PD replica, on its own
+loopback via ECS Exec, and requires them to agree on one cluster id, then stops
+a PD task and checks that its replacement *joins* rather than bootstrapping a
+second cluster. Nothing in the stack is reachable from outside the VPC. It
+creates billable AWS resources and is gated behind both a build tag and an
+environment variable:
+
+```bash
+cd e2e/tikv && make e2e     # provision, assert, tear down
+```
+
+The Starlark scripts it deploys are loaded and checked by the ordinary `go test
+./...` run, so a syntax error surfaces without an AWS account.
