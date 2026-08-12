@@ -420,7 +420,7 @@ trusted to have reaped a lapsed lease.
 PD = lambda ip: "http://%s:2379" % ip
 
 def resolver():
-    me = ifaddr("172.31.255.0/24")
+    me = SELF.ipv4
     peers = [i.ipv4 for i in instances("tikv-pd") if i.ipv4 != me]
 
     if path_exists("/pd/member"):                        # (A) restart existing member
@@ -439,11 +439,11 @@ def resolver():
                       "--advertise-peer-urls", "http://%s:2380" % me] + mode
 
 def liveness():                                          # settles when PD stops being live
-    me = ifaddr("172.31.255.0/24")
+    me = SELF.ipv4
     return poll(un(http_ok(PD(me) + "/pd/api/v1/health", "2s")), "24h", interval="10s")
 
 def on_stop():
-    me = ifaddr("172.31.255.0/24")
+    me = SELF.ipv4
     run(["/pd-ctl", "-u", PD(me), "member", "delete", "name", SELF.id])
     kv_delete("tikv-pd/seed", if_value = me)
 

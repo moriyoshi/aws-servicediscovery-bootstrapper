@@ -282,3 +282,64 @@ func TestE2ETiKVGCPReportSurvivesADeadPD(t *testing.T) {
 func errorMentions(err error, substr string) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), strings.ToLower(substr))
 }
+
+// me() is where both stacks answer "what address do I advertise to my peers?",
+// and it was the last place the two scripts disagreed for no reason: the AWS
+// pair picked the address off the interface with ifaddr(MUSTER_SUBNET_CIDR)
+// while the Google Cloud pair read SELF.ipv4, which the AWS provider populates
+// too (internal/provider/aws/identity.go). The variable was required, so a stack
+// that forgot it failed at load time over a value muster already had.
+//
+// SELF.ipv4 is now the source on both, and MUSTER_SUBNET_CIDR is optional --
+// which these scripts prove by loading without it.
+func TestE2ETiKVAWSMeUsesSelfIPv4(t *testing.T) {
+	for _, path := range []string{
+		"e2e/tikv/aws/docker/tikv-pd/pd.star",
+		"e2e/tikv/aws/docker/tikv-node/tikv.star",
+	} {
+		t.Run(strings.TrimPrefix(path, "e2e/tikv/aws/docker/"), func(t *testing.T) {
+			t.Setenv("MUSTER_PD_SERVICE", "tikv-pd")
+			t.Setenv("MUSTER_PD_REPLICAS", "3")
+			// Deliberately unset: the point is that the script no longer needs it.
+			t.Setenv("MUSTER_SUBNET_CIDR", "")
+
+			self := &provider.Identity{IPv4: "172.31.255.42", Group: "c", Service: "tikv-pd"}
+			eng, err := loadScript(context.Background(), filepath.FromSlash(path),
+				&engineDeps{logger: testLogger(), provider: "aws", self: self})
+			if err != nil {
+				t.Fatalf("loadScript(%s) without MUSTER_SUBNET_CIDR: %v", path, err)
+			}
+
+			v, err := eng.invokeValue(context.Background(), eng.globals["me"], nil)
+			if err != nil {
+				t.Fatalf("me(): %v", err)
+			}
+			if got, _ := starlark.AsString(v); got != self.IPv4 {
+				t.Errorf("me() = %q, want %q from SELF.ipv4", got, self.IPv4)
+			}
+		})
+	}
+}
+
+// The fallback is the reason ifaddr() stayed: muster reads the task metadata
+// once at startup, best-effort and without retry, so SELF can be empty on a
+// platform that supports it. With neither source available me() must say so
+// rather than advertise an address it invented.
+func TestE2ETiKVAWSMeFailsWithNoAddressSource(t *testing.T) {
+	t.Setenv("MUSTER_PD_SERVICE", "tikv-pd")
+	t.Setenv("MUSTER_SUBNET_CIDR", "")
+
+	eng, err := loadScript(context.Background(),
+		filepath.FromSlash("e2e/tikv/aws/docker/tikv-pd/pd.star"),
+		&engineDeps{logger: testLogger(), provider: "aws", self: nil})
+	if err != nil {
+		t.Fatalf("loadScript: %v", err)
+	}
+	_, err = eng.invokeValue(context.Background(), eng.globals["me"], nil)
+	if err == nil {
+		t.Fatal("me() returned an address with no SELF and no CIDR")
+	}
+	if !strings.Contains(err.Error(), "MUSTER_SUBNET_CIDR") {
+		t.Errorf("me() failed without naming the missing configuration: %v", err)
+	}
+}
