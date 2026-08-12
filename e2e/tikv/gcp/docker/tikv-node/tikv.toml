@@ -1,0 +1,31 @@
+# TiKV configuration for Cloud Run.
+#
+# TiKV refuses to start unless RLIMIT_NOFILE is at least
+#
+#     1000 + rocksdb.max-open-files + raftdb.max-open-files
+#
+# with the rocksdb term counted twice when Titan is enabled, as it is by
+# default. At the stock 40960 that is 1000 + 3 * 40960 = 123880, which is the
+# number in the startup failure.
+#
+# The ECS stack simply asks for it: the task definition sets a nofile ulimit of
+# 123880 and Fargate grants it. Cloud Run caps a container at 25000 and that cap
+# is the *hard* limit, so no amount of setrlimit(2) from inside the container
+# raises it -- that needs CAP_SYS_RESOURCE, which Cloud Run does not give. There
+# is no worker pool setting for it either.
+#
+# So the demand comes down instead of the limit going up:
+#
+#     1000 + 2 * 4096 + 4096 = 13288
+#
+# which leaves most of the 25000 for sockets -- a store holds connections to
+# every PD and every peer. max-open-files is a cap on RocksDB's table cache, not
+# a correctness setting: below it, SST files are closed and reopened on demand.
+# 4096 is far more than this test's data will ever occupy, and the cost of being
+# wrong is latency rather than failure.
+
+[rocksdb]
+max-open-files = 4096
+
+[raftdb]
+max-open-files = 4096

@@ -39,6 +39,7 @@ scripts are near-copies of the ECS ones rather than a rethink:
 | `pre_stop` must evict the member | yes | yes |
 | registration | ECS Service Connect does it | **nothing does it** — `register()` from `post_start` |
 | shutdown budget | 30s, up to 120s | **10s, fixed** |
+| file descriptors | `ulimit nofile = 123880` in the task definition | **capped at 25000**, and it is the hard limit |
 
 The **ephemeral disk needs `medium = "DISK"`**. Cloud Run's default is `MEMORY`,
 which is charged against the instance's memory limit — PD's data directory would
@@ -51,6 +52,16 @@ seconds later, full stop. `pd.star`'s `pre_stop` has to release the seed lease
 so it fits, but `pre_stop_timeout` is 5s and `shutdown_grace` 8s rather than the
 ECS script's 20s and 30s. Miss that window and the Raft group accumulates a dead
 member per replacement until it loses quorum.
+
+The **file-descriptor cap is why the stores carry a config file.** TiKV refuses
+to start unless `RLIMIT_NOFILE` is at least `1000 + rocksdb.max-open-files +
+raftdb.max-open-files`, counting the rocksdb term twice while Titan is on --
+1000 + 3 × 40960 = 123880 at the defaults. The ECS stack simply asks Fargate for
+that many. Cloud Run's 25000 is a *hard* limit, so `setrlimit(2)` from inside the
+container cannot raise it (that needs `CAP_SYS_RESOURCE`) and no worker pool
+setting exposes it. `docker/tikv-node/tikv.toml` brings the demand down to
+13288 instead; `max-open-files` caps RocksDB's table cache, so the cost of the
+lower value is latency on a working set this test will never have.
 
 ## How the cluster is observed
 

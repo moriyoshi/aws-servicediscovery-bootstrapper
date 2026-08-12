@@ -356,6 +356,33 @@ after a short grace period so a joiner racing the rejection is not
 double-reported. A supervisor whose job is to make failures visible should not
 have a way to lose one silently.
 
+### The file-descriptor cap
+
+TiKV would not start on Cloud Run: `the maximum number of open file descriptors
+is too small, got 25000, expect greater or equal to 123880`. The expectation is
+`1000 + rocksdb.max-open-files + raftdb.max-open-files`, with the rocksdb term
+counted twice while Titan is enabled -- exactly 1000 + 3 × 40960 at the stock
+settings, which is where the oddly specific number comes from.
+
+The ECS stack never met this because it asks for the limit it wants: the task
+definition carries `ulimit nofile = 123880` and Fargate grants it. Cloud Run
+caps a container at 25000 and that cap is the *hard* limit, so raising the soft
+limit from inside is impossible -- it needs `CAP_SYS_RESOURCE`, which the
+sandbox does not grant -- and no worker pool setting exposes it. Which also
+settles the tempting idea of teaching muster to raise `RLIMIT_NOFILE` before
+exec: a sound thing for a PID 1 to do in general, and worth nothing here.
+
+So the demand comes down instead of the limit going up, in
+`docker/tikv-node/tikv.toml`: `max-open-files = 4096` on both engines, needing
+13288. It is a cap on RocksDB's table cache rather than a correctness setting --
+past it, SST files are closed and reopened on demand -- so the cost of being
+wrong is latency, not failure.
+
+Verified locally rather than argued: a single-node PD plus a store under
+`--ulimit nofile=25000:25000` reproduces the production FATAL from the same
+source line, and the same pair with the config file mounted bootstraps the
+cluster and reaches `Up`.
+
 ### Deferred
 
 - Stale Service Directory endpoint reaping (an instance killed without teardown
