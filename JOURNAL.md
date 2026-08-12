@@ -463,24 +463,38 @@ depends on noticing. The fix was also run against the live pools before landing.
 
 ### What the real Cloud Run runs proved, and what they did not
 
-The Google Cloud stack **has been applied**, several times, against a real
-project. That changes the status of the most important claim in this document.
+The Google Cloud stack **has been applied**, repeatedly, against a real project.
+That settles the most important claim in this document, and most of the others.
 
-**Seed election works on Cloud Run.** In production, on worker pools, from a
-cold start: one replica took the lease and bootstrapped, the other two followed
-it, all three registered themselves through `register()`, and PD reported one
-cluster id with quorum formed. Every endpoint in Service Directory got there
-through muster's own code, because nothing on Cloud Run registers an instance —
-so unlike the CloudMap side, that is a test of muster rather than of the
-platform. This is the part the whole provider exists for and it is no longer
-theoretical.
+**A complete TiKV cluster now runs on Cloud Run worker pools, assembled by
+muster.** Read off the live stack rather than inferred:
 
-**The suite has still never passed end to end**, and the reason was never the
-election. Four separate failures, each costing a provision: registry
-authentication, a configuration variable nothing read, the reporting loop's
-silent death, and TiKV's file-descriptor demand. The store tier has
-never come up, so `StoresUp` and the store half of `NoSplitBrain` remain
-unexercised, and `PDReplacementRejoins` has never run at all.
+| Assertion | Live state |
+| --- | --- |
+| `PoolsReachReady` | both pools `Ready=True`, reconciled onto their created revision |
+| `ServiceDirectoryRegistrations` | 6 endpoints, 3 per tier — **every one written by `register()`**, since nothing on Cloud Run registers an instance |
+| `PDClusterBootstrapped` | all three replicas report a non-zero cluster id |
+| `NoSplitBrain` | all three report the *same* id, `7673139720976975013` |
+| `QuorumComplete` | each sees 3 members, not just itself |
+| `StoresUp` | 3 stores, `['Up', 'Up', 'Up']`, from each replica independently |
+| `SeedLease` | held by `10.128.253.18`, which is a registered replica |
+| `PDReplacementRejoins` | **not exercised** |
+
+Seed election is the part the whole provider exists for, and on Cloud Run it is
+no longer theoretical: from a cold start one replica took the lease and
+bootstrapped, two followed it, and every replica agrees on one cluster.
+
+Two of this session's fixes are confirmed in production by that table rather
+than by argument — the store tier is up, so the file-descriptor config works;
+and the numbers above were *read from the self-reports*, so the reporting loop
+survives its own failing first samples.
+
+**The suite has still never been run green end to end**, which is a smaller
+claim than it used to be: what is missing is one clean pass, not a working
+cluster. Five failures got in the way, each costing a provision, and the
+election was never one of them — registry authentication, a configuration
+variable nothing read, the reporting loop's silent death, TiKV's file-descriptor
+demand, and a readiness check reading the wrong API's field names.
 
 Still not verified, and needing infrastructure:
 
@@ -494,6 +508,9 @@ Still not verified, and needing infrastructure:
   single-process and cannot reproduce contention, retries, or the per-object
   write rate. The same gap applies to Firestore, where the emulator stands in
   for the server whose transaction semantics are the thing under test.
+- **`PDReplacementRejoins`** and the **Firestore backend against a real
+  database** (`KV_BACKEND=firestore`) are the two paths on Google Cloud that no
+  run has touched.
 
 ### Deferred
 
@@ -524,14 +541,18 @@ failure there means the provider work broke something rather than that new
 infrastructure code is wrong. It also now carries a change of its own: `me()`
 reads `SELF.ipv4` rather than `ifaddr()`, which has not been near Fargate.
 
-Then `e2e/tikv/gcp`, where the next unknown is simply *the store tier*, which
-has never started. Everything past that point is unexercised. After it, expect
-the ten-second shutdown budget to be what bites: if `pre_stop` cannot evict a
-member inside it, the Raft group collects a dead member per replacement and the
-symptom is a slow loss of quorum rather than an obvious failure. `make logs-pd`
-and `make logs-tikv` are where both show.
+Then `e2e/tikv/gcp`, which now needs one clean pass rather than another repair:
+the cluster assembles, and every assertion but `PDReplacementRejoins` has been
+confirmed against a live stack by hand. That one is the next real unknown, and
+the ten-second shutdown budget is what should bite — if `pre_stop` cannot
+release the lease and evict the member inside it, the Raft group collects a dead
+member per replacement and the symptom is a slow loss of quorum rather than an
+obvious failure. `make logs-pd` and `make logs-tikv` are where it shows.
 
-The pattern across every failure so far is worth carrying forward: none was in
-the election logic, and all four were in the space between muster and the
+The pattern across every failure so far is worth carrying forward: not one was
+in the election logic. All five were in the space between muster and the
 platform — a registry credential, a variable name, a background task nobody
-joined, a resource limit. That space is where the remaining risk is too.
+joined, a resource limit, and a field name. Four of the five were *silent*: they
+produced an empty value, an unread variable, a discarded error, a log with
+nothing in it. That space, and that failure mode, is where the remaining risk
+is.
