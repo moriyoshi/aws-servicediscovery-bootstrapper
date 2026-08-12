@@ -33,6 +33,11 @@ type promise struct {
 	cancelFn    context.CancelFunc   // task ctx cancel; nil for a bare promise
 	signalFn    func(starlark.Value) // custom signal handler (spawn); nil = default settle
 
+	// awaited records that something looked at the outcome -- join(), select(),
+	// any_true(). A promise that rejects with this still false is a failure
+	// nobody will ever hear about, which spawnFunc reports rather than swallow.
+	awaited atomic.Bool
+
 	mu        sync.Mutex
 	settled   bool
 	canceling bool
@@ -78,6 +83,7 @@ func (p *promise) isSettled() bool {
 // await blocks until the promise settles or ctx is cancelled. The channel close
 // is the happens-before edge, so value/err are read without the lock.
 func (p *promise) await(ctx context.Context) (starlark.Value, error) {
+	p.awaited.Store(true)
 	select {
 	case <-p.doneCh:
 		return p.value, p.err

@@ -16,6 +16,8 @@ import (
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
+
+	"github.com/moriyoshi/muster/internal/provider"
 )
 
 const defaultProbeTimeout = 2 * time.Second
@@ -116,9 +118,13 @@ func buildPredeclared(deps *engineDeps) starlark.StringDict {
 		return starlark.NewBuiltin(name, fn)
 	}
 
+	// PROVIDER is present even when SELF is None, which is exactly when a script
+	// needs it: identity failing to resolve is when branching on the platform
+	// matters most.
 	env := starlark.StringDict{
-		"TASK":    taskMetaToStarlark(deps.meta),
-		"COMMAND": stringsToStarlark(deps.command),
+		"SELF":     selfToStarlark(deps.self),
+		"PROVIDER": starlark.String(deps.provider),
+		"COMMAND":  stringsToStarlark(deps.command),
 	}
 
 	env["instances"] = b("instances", func(t *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
@@ -126,7 +132,15 @@ func buildPredeclared(deps *engineDeps) starlark.StringDict {
 		if err := starlark.UnpackArgs("instances", args, kwargs, "service", &service, "health_status?", &healthStatus, "namespace?", &namespace); err != nil {
 			return nil, err
 		}
-		entries, err := deps.sd.discover(ctxOf(t), namespace, service, healthStatus)
+		disc, err := deps.disc.require("service discovery")
+		if err != nil {
+			return nil, err
+		}
+		entries, err := disc.Discover(ctxOf(t), provider.Query{
+			Namespace: namespace,
+			Service:   service,
+			Health:    healthStatus,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -189,7 +203,8 @@ func buildPredeclared(deps *engineDeps) starlark.StringDict {
 
 	addKVBuiltins(env, b, deps)
 	addHealthBuiltins(env, b, deps)
-	addECSBuiltins(env, b, deps)
+	addReplicaBuiltins(env, b, deps)
+	addRegistrationBuiltins(env, b, deps)
 	addAsyncBuiltins(env, b, deps)
 	addSpawnBuiltin(env, b, deps)
 
@@ -312,11 +327,8 @@ func buildPredeclared(deps *engineDeps) starlark.StringDict {
 type builtinFactory = func(string, func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error)) *starlark.Builtin
 
 func addKVBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) {
-	requireKV := func() error {
-		if deps.kv == nil {
-			return fmt.Errorf("kv store not configured (set -kv-table)")
-		}
-		return nil
+	requireKV := func() (provider.KVStore, error) {
+		return deps.kv.require("kv store")
 	}
 
 	env["kv_put_if_absent"] = b("kv_put_if_absent", func(t *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
@@ -325,14 +337,15 @@ func addKVBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) 
 		if err := starlark.UnpackArgs("kv_put_if_absent", args, kwargs, "key", &key, "val", &val, "ttl?", &ttlVal); err != nil {
 			return nil, err
 		}
-		if err := requireKV(); err != nil {
+		kv, err := requireKV()
+		if err != nil {
 			return nil, err
 		}
 		ttl, err := unpackDuration(ttlVal)
 		if err != nil {
 			return nil, err
 		}
-		ok, err := deps.kv.PutIfAbsent(ctxOf(t), key, val, ttl)
+		ok, err := kv.PutIfAbsent(ctxOf(t), key, val, ttl)
 		if err != nil {
 			return nil, err
 		}
@@ -345,14 +358,15 @@ func addKVBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) 
 		if err := starlark.UnpackArgs("kv_compare_and_swap", args, kwargs, "key", &key, "old", &old, "new", &new, "ttl?", &ttlVal); err != nil {
 			return nil, err
 		}
-		if err := requireKV(); err != nil {
+		kv, err := requireKV()
+		if err != nil {
 			return nil, err
 		}
 		ttl, err := unpackDuration(ttlVal)
 		if err != nil {
 			return nil, err
 		}
-		ok, err := deps.kv.CompareAndSwap(ctxOf(t), key, old, new, ttl)
+		ok, err := kv.CompareAndSwap(ctxOf(t), key, old, new, ttl)
 		if err != nil {
 			return nil, err
 		}
@@ -364,10 +378,11 @@ func addKVBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) 
 		if err := starlark.UnpackArgs("kv_get", args, kwargs, "key", &key); err != nil {
 			return nil, err
 		}
-		if err := requireKV(); err != nil {
+		kv, err := requireKV()
+		if err != nil {
 			return nil, err
 		}
-		val, ok, err := deps.kv.Get(ctxOf(t), key)
+		val, ok, err := kv.Get(ctxOf(t), key)
 		if err != nil {
 			return nil, err
 		}
@@ -383,7 +398,8 @@ func addKVBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) 
 		if err := starlark.UnpackArgs("kv_delete", args, kwargs, "key", &key, "if_value?", &ifValue); err != nil {
 			return nil, err
 		}
-		if err := requireKV(); err != nil {
+		kv, err := requireKV()
+		if err != nil {
 			return nil, err
 		}
 		var cond *string
@@ -394,7 +410,7 @@ func addKVBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) 
 			}
 			cond = &s
 		}
-		ok, err := deps.kv.Delete(ctxOf(t), key, cond)
+		ok, err := kv.Delete(ctxOf(t), key, cond)
 		if err != nil {
 			return nil, err
 		}
@@ -407,14 +423,15 @@ func addKVBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) 
 		if err := starlark.UnpackArgs("kv_renew", args, kwargs, "key", &key, "ttl", &ttlVal); err != nil {
 			return nil, err
 		}
-		if err := requireKV(); err != nil {
+		kv, err := requireKV()
+		if err != nil {
 			return nil, err
 		}
 		ttl, err := unpackDuration(ttlVal)
 		if err != nil {
 			return nil, err
 		}
-		ok, err := deps.kv.Renew(ctxOf(t), key, ttl)
+		ok, err := kv.Renew(ctxOf(t), key, ttl)
 		if err != nil {
 			return nil, err
 		}
@@ -422,22 +439,26 @@ func addKVBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) 
 	})
 }
 
-// addECSBuiltins registers all_ecs_tasks_running(), the predicate behind the old
-// -precondition=AllEcsTasksRunning check. Fold it into pre_start() with poll
-// (e.g. join(poll(all_ecs_tasks_running, "60s"))). Cluster/service default to the
-// running task's own, from ECS task metadata.
-func addECSBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) {
-	resolveTarget := func(clusterV, serviceV starlark.Value) (string, string, error) {
-		cluster, service := "", ""
-		if deps.meta != nil {
-			cluster, service = deps.meta.Cluster, deps.meta.ServiceName
+// addReplicaBuiltins registers all_replicas_running(), the orchestrator-level
+// precondition. Fold it into pre_start() with poll (e.g.
+// join(poll(all_replicas_running, "60s"))). group/service default to the running
+// instance's own, from SELF.
+//
+// The argument order is group-then-service, matching the cluster-then-service it
+// replaces: both are optional strings, so reversing them to match instances()
+// would let a hand-migrated call swap its two arguments and still typecheck.
+func addReplicaBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) {
+	resolveTarget := func(groupV, serviceV starlark.Value) (string, string, error) {
+		group, service := "", ""
+		if deps.self != nil {
+			group, service = deps.self.Group, deps.self.Service
 		}
-		if clusterV != nil && clusterV != starlark.None {
-			s, ok := starlark.AsString(clusterV)
+		if groupV != nil && groupV != starlark.None {
+			s, ok := starlark.AsString(groupV)
 			if !ok {
-				return "", "", fmt.Errorf("cluster must be a string")
+				return "", "", fmt.Errorf("group must be a string")
 			}
-			cluster = s
+			group = s
 		}
 		if serviceV != nil && serviceV != starlark.None {
 			s, ok := starlark.AsString(serviceV)
@@ -446,31 +467,26 @@ func addECSBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps)
 			}
 			service = s
 		}
-		if cluster == "" || service == "" {
-			return "", "", fmt.Errorf("ECS cluster/service unknown (no task metadata); pass cluster= and service=")
+		if group == "" || service == "" {
+			return "", "", fmt.Errorf("group/service unknown (no instance metadata); pass group= and service=")
 		}
-		return cluster, service, nil
-	}
-	requireECS := func() error {
-		if deps.ecs == nil {
-			return fmt.Errorf("ECS client not configured")
-		}
-		return nil
+		return group, service, nil
 	}
 
-	env["all_ecs_tasks_running"] = b("all_ecs_tasks_running", func(t *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		var clusterV, serviceV starlark.Value
-		if err := starlark.UnpackArgs("all_ecs_tasks_running", args, kwargs, "cluster?", &clusterV, "service?", &serviceV); err != nil {
+	env["all_replicas_running"] = b("all_replicas_running", func(t *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		var groupV, serviceV starlark.Value
+		if err := starlark.UnpackArgs("all_replicas_running", args, kwargs, "group?", &groupV, "service?", &serviceV); err != nil {
 			return nil, err
 		}
-		if err := requireECS(); err != nil {
-			return nil, err
-		}
-		cluster, service, err := resolveTarget(clusterV, serviceV)
+		fleet, err := deps.fleet.require("replica status")
 		if err != nil {
 			return nil, err
 		}
-		stable, err := ecsServiceStable(ctxOf(t), deps.ecs, cluster, service)
+		group, service, err := resolveTarget(groupV, serviceV)
+		if err != nil {
+			return nil, err
+		}
+		stable, err := fleet.AllReplicasRunning(ctxOf(t), provider.WorkloadRef{Group: group, Name: service})
 		if err != nil {
 			return nil, err
 		}
@@ -593,5 +609,52 @@ func addHealthBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDe
 			"status": starlark.MakeInt(resp.StatusCode),
 			"body":   starlark.String(string(respBody)),
 		}), nil
+	})
+}
+
+// addRegistrationBuiltins registers register()/deregister(), which publish this
+// instance into the provider's service registry so peers can discover it.
+//
+// They exist because not every platform does it for you. ECS Service Connect
+// registers tasks into CloudMap automatically, so the AWS provider reports this
+// unsupported and a script calling register() there is told so rather than
+// silently doing nothing. Nothing registers a Cloud Run worker pool instance,
+// so a clustered workload there has to announce itself -- typically from
+// post_start, with deregister() from pre_stop while peers are still reachable.
+func addRegistrationBuiltins(env starlark.StringDict, b builtinFactory, deps *engineDeps) {
+	env["register"] = b("register", func(t *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		var service, address, namespace string
+		var port int
+		if err := starlark.UnpackArgs("register", args, kwargs,
+			"service", &service, "port?", &port, "address?", &address, "namespace?", &namespace); err != nil {
+			return nil, err
+		}
+		reg, err := deps.reg.require("registration")
+		if err != nil {
+			return nil, err
+		}
+		if err := reg.Register(ctxOf(t), provider.Registration{
+			Namespace: namespace,
+			Service:   service,
+			Address:   address,
+			Port:      port,
+		}); err != nil {
+			return nil, err
+		}
+		return starlark.None, nil
+	})
+
+	env["deregister"] = b("deregister", func(t *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		if err := starlark.UnpackArgs("deregister", args, kwargs); err != nil {
+			return nil, err
+		}
+		reg, err := deps.reg.require("registration")
+		if err != nil {
+			return nil, err
+		}
+		if err := reg.Deregister(ctxOf(t)); err != nil {
+			return nil, err
+		}
+		return starlark.None, nil
 	})
 }

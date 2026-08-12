@@ -8,6 +8,9 @@ import (
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
+
+	"github.com/moriyoshi/muster/internal/provider"
+	"github.com/moriyoshi/muster/internal/provider/memkv"
 )
 
 func awaitPromise(t *testing.T, v starlark.Value) (starlark.Value, error) {
@@ -100,14 +103,14 @@ func TestSpawnNoRespawnFailsFast(t *testing.T) {
 }
 
 func TestSpawnReadinessAndSignalStop(t *testing.T) {
-	kv := newMemKV("o")
+	kv := memkv.New("o")
 	st := newHarnessState()
 	src := `
 def readiness(): return poll(lambda: kv_get("up") != None, "5s", interval="10ms")
 def main():
     return spawn(resolve=lambda: ["sh", "-c", "sleep 30"], readiness=readiness)
 `
-	v, err := runMain(t, src, &engineDeps{kv: kv, st: st})
+	v, err := runMain(t, src, &engineDeps{kv: resolved[provider.KVStore](kv), st: st})
 	if err != nil {
 		t.Fatalf("main: %v", err)
 	}
@@ -128,7 +131,7 @@ def main():
 }
 
 func TestSpawnLivenessRestart(t *testing.T) {
-	kv := newMemKV("o")
+	kv := memkv.New("o")
 	st := newHarnessState()
 	// Each attempt clears the "dead" trigger so setting it causes exactly one restart.
 	src := `
@@ -140,7 +143,7 @@ def main():
     return spawn(resolve=resolver, liveness=liveness, respawn=True, restart_on_liveness=True,
                  max_retries=0, initial_interval="1ms", max_interval="1ms", reset_after="1h")
 `
-	v, err := runMain(t, src, &engineDeps{kv: kv, st: st})
+	v, err := runMain(t, src, &engineDeps{kv: resolved[provider.KVStore](kv), st: st})
 	if err != nil {
 		t.Fatalf("main: %v", err)
 	}
@@ -155,7 +158,7 @@ def main():
 }
 
 func TestSpawnPostStartPostStop(t *testing.T) {
-	kv := newMemKV("o")
+	kv := memkv.New("o")
 	st := newHarnessState()
 	// post_start runs once the process is up; post_stop after it has exited.
 	src := `
@@ -165,7 +168,7 @@ def main():
     return spawn(resolve=lambda: ["sh", "-c", "exit 0"],
                  post_start=post_start, post_stop=post_stop)
 `
-	if _, err := awaitPromise(t, mustMain(t, src, &engineDeps{kv: kv, st: st})); err != nil {
+	if _, err := awaitPromise(t, mustMain(t, src, &engineDeps{kv: resolved[provider.KVStore](kv), st: st})); err != nil {
 		t.Fatalf("await: %v", err)
 	}
 	if v, ok, _ := kv.Get(context.Background(), "started"); !ok || v != "1" {
@@ -177,7 +180,7 @@ def main():
 }
 
 func TestMultipleWorkloadsRegistered(t *testing.T) {
-	kv := newMemKV("o")
+	kv := memkv.New("o")
 	st := newHarnessState()
 	// main() coordinates two independent workloads; each has its own readiness
 	// signal and its own entry in the snapshot.
@@ -188,7 +191,7 @@ def main():
     b = spawn(name="b", resolve=lambda: ["sh", "-c", "sleep 30"], readiness=ready("b"))
     return go(lambda: join(a, b))
 `
-	if _, err := runMain(t, src, &engineDeps{kv: kv, st: st}); err != nil {
+	if _, err := runMain(t, src, &engineDeps{kv: resolved[provider.KVStore](kv), st: st}); err != nil {
 		t.Fatalf("main: %v", err)
 	}
 	kv.PutIfAbsent(context.Background(), "a", "1", 0)

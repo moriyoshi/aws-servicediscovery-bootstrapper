@@ -46,5 +46,45 @@ jobs:
       - name: Vet (e2e build tag)
         run: go vet -tags=e2e ./...
 
+      # Neither end-to-end suite is run in CI -- each provisions real
+      # infrastructure -- but both are in the same module, so vetting them under
+      # their tags is the only thing that keeps their harnesses compiling.
+      - name: Vet (e2e_tikv build tag)
+        run: go vet -tags=e2e_tikv ./...
+
+      - name: Vet (e2e_tikv_gcp build tag)
+        run: go vet -tags=e2e_tikv_gcp ./...
+
       - name: Test
         run: go test -race -shuffle=on -cover ./...
+
+      # The provider is chosen at build time, so the tag that is not the default
+      # needs its own build, vet and test or it rots. Separate steps rather than
+      # one combined -tags list: a failure has to be attributable to a tag.
+      - name: Build (gcp build tag)
+        run: go build -tags=gcp ./...
+
+      - name: Vet (gcp build tag)
+        run: go vet -tags=gcp ./...
+
+      - name: Test (gcp build tag)
+        run: go test -race -shuffle=on -tags=gcp ./...
+
+      # gcp_live needs a real bucket and is never run here, but vetting it keeps
+      # it compiling -- the mistake e2e_tikv spent months making.
+      - name: Vet (gcp_live build tag)
+        run: go vet -tags=gcp,gcp_live ./...
+
+      # The whole point of the build tags is that the default image carries one
+      # cloud's SDK and not the others. Nothing else catches an import that
+      # escaped its build constraint until someone measures the image.
+      - name: Assert the builds do not cross-link cloud SDKs
+        run: |
+          if go list -deps . | grep -E '^(cloud\.google\.com|google\.golang\.org/api)'; then
+            echo "::error::the default build links Google Cloud packages; a gcp-only import escaped its build tag"
+            exit 1
+          fi
+          if go list -tags=gcp -deps . | grep -E '^github\.com/aws/'; then
+            echo "::error::the gcp build links the AWS SDK; check the provider registration build tags"
+            exit 1
+          fi
