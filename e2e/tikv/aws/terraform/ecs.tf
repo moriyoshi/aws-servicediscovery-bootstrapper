@@ -70,6 +70,11 @@ locals {
   # so rather than depending on that path. (Reading the metadata endpoint is
   # also how this stack found the bug where muster looked for the wrong
   # environment variable and so never had metadata on ECS at all.)
+  #
+  # MUSTER_SUBNET_CIDR is the same idea one layer down: the scripts advertise
+  # SELF.ipv4, which also comes from that metadata endpoint, and fall back to
+  # picking the address off the interface with ifaddr(). It is optional to the
+  # scripts and passed here so the fallback is actually available.
   muster_env = [
     { name = "MUSTER_SUBNET_CIDR", value = var.internal_subnet_cidr },
     { name = "MUSTER_PD_SERVICE", value = local.pd_discovery_name },
