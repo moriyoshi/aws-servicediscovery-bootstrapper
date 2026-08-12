@@ -126,3 +126,37 @@ func TestParseEntriesOnNoLogs(t *testing.T) {
 		t.Error("ParseEntries accepted malformed output")
 	}
 }
+
+// A failure dump that reaches none of muster's decisions is the reason this
+// split exists: PD writes thousands of lines an hour, so a flat tail of a few
+// hundred covers a minute of raft chatter and nothing else. Separating the two
+// lets the dump keep every decision and still bound the workload's output.
+func TestDecisionsAndWorkloadSplitTheLog(t *testing.T) {
+	const out = `[
+	  {"timestamp": "2026-08-12T13:00:01Z", "jsonPayload": {"msg": "pd: won the seed lease, bootstrapping a new cluster", "name": "pd-a"}},
+	  {"timestamp": "2026-08-12T13:00:02Z", "jsonPayload": {"msg": "pd: STORES", "who": "a", "body": "{}"}},
+	  {"timestamp": "2026-08-12T13:00:03Z", "textPayload": "[INFO] raft chatter"},
+	  {"timestamp": "2026-08-12T13:00:04Z", "jsonPayload": {"msg": "registered endpoint", "level": "INFO"}},
+	  {"timestamp": "2026-08-12T13:00:05Z", "jsonPayload": {"msg": "pd: CLUSTER", "who": "a", "body": "{}"}}
+	]`
+	entries, err := ParseEntries([]byte(out))
+	if err != nil {
+		t.Fatalf("ParseEntries: %v", err)
+	}
+
+	got := Decisions(entries)
+	if len(got) != 2 {
+		t.Fatalf("Decisions() returned %d lines, want the 2 muster wrote that are not reports", len(got))
+	}
+	for _, e := range got {
+		if e.IsReport() {
+			t.Errorf("Decisions() kept a periodic report: %s", e.JSON.Msg)
+		}
+	}
+
+	// The workload's own output is the other half, and none of muster's.
+	w := Workload(entries)
+	if len(w) != 1 || w[0].Text != "[INFO] raft chatter" {
+		t.Fatalf("Workload() = %+v, want the one textPayload line", w)
+	}
+}

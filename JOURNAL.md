@@ -484,6 +484,44 @@ type, the revision label and both payload shapes are pinned against real data
 instead of against my memory of an API. Verified against the live cluster as
 well: three replicas, one cluster id, from the current revision only.
 
+### The suite runs, and the last subtest asserted the impossible
+
+Seven of eight subtests pass against a real project: `PoolsReachReady`,
+`ServiceDirectoryRegistrations`, `PDClusterBootstrapped`, `NoSplitBrain`,
+`QuorumComplete`, `StoresUp`, `SeedLease`. Everything the provider exists to do,
+end to end, on Cloud Run worker pools.
+
+`PDReplacementRejoins` failed, and it was right to. It rolled the PD revision
+and required the cluster id to survive — but **a Cloud Run revision update
+replaces every instance of a worker pool**, and with three ephemeral disks
+discarded together there is nothing left to carry the cluster. The seed lease
+carries an address, not cluster state, and PD cannot be told to adopt an id. So
+the new tier bootstrapped a new cluster, correctly: id ...4512 before, ...0939
+after. The test asserted a property the platform cannot provide, and the README
+called it "the strongest statement this platform allows" while it was in fact a
+statement about a different platform — Fargate, where the ECS suite stops *one*
+task.
+
+The fix is to make the same claim the ECS suite makes: `--no-promote` to deploy
+the revision with no instances, then `update-instance-split --to-revisions=
+<new>=34` to move one instance of three onto it. Two members survive, quorum
+holds, and the replacement has a cluster to join. It also now asserts membership
+returns to three, because agreeing about which cluster you are in is not the
+same as being in it.
+
+**How it failed is the more useful half.** The mismatched cluster id was visible
+in the very first poll, and the check said `2 of 3 replacements have reported`
+for twenty minutes instead, because it counted replicas before comparing what
+they said. A test whose single purpose is catching a split brain reported a
+split brain as a timeout. The comparison now runs first and is terminal.
+
+And the failure dump could not have explained any of it: 300 lines of a pool
+where PD writes thousands an hour is about ninety seconds of raft chatter, with
+none of muster's decisions in it. Dumps now print every line muster wrote —
+which branch each replica took, what it registered, what it respawned — and then
+a bounded tail of the workload's own output. Everything muster says across an
+hour fits in a fraction of what the workload says in a minute.
+
 ### Verified
 
 - `gofmt` clean; build + vet under every tag (default, `e2e`, `e2e_tikv`,
@@ -516,7 +554,7 @@ muster.** Read off the live stack rather than inferred:
 | `QuorumComplete` | each sees 3 members, not just itself |
 | `StoresUp` | 3 stores, `['Up', 'Up', 'Up']`, from each replica independently |
 | `SeedLease` | held by `10.128.253.18`, which is a registered replica |
-| `PDReplacementRejoins` | **not exercised** |
+| `PDReplacementRejoins` | **failed** — see below; it asserted something Cloud Run cannot do |
 
 Seed election is the part the whole provider exists for, and on Cloud Run it is
 no longer theoretical: from a cold start one replica took the lease and
@@ -527,12 +565,12 @@ than by argument — the store tier is up, so the file-descriptor config works;
 and the numbers above were *read from the self-reports*, so the reporting loop
 survives its own failing first samples.
 
-**The suite has still never been run green end to end**, which is a smaller
-claim than it used to be: what is missing is one clean pass, not a working
-cluster. Five failures got in the way, each costing a provision, and the
-election was never one of them — registry authentication, a configuration
-variable nothing read, the reporting loop's silent death, TiKV's file-descriptor
-demand, and a readiness check reading the wrong API's field names.
+**Seven of the eight subtests now pass in one run.** The eighth, and the six
+failures that preceded it, were never the election — registry authentication, a
+configuration variable nothing read, the reporting loop's silent death, TiKV's
+file-descriptor demand, a readiness check reading the wrong API's field names,
+three stacked defects in the log reads, and finally an assertion that the
+platform cannot satisfy.
 
 Still not verified, and needing infrastructure:
 

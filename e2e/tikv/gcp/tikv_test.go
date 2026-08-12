@@ -217,10 +217,21 @@ func TestTiKVOnCloudRun(t *testing.T) {
 		// offers. What must not happen is the replacement deciding it is alone
 		// and bootstrapping a second cluster.
 		//
-		// Rolling the revision replaces every instance, which is the bluntest
-		// version of the test: the whole PD tier turns over and the cluster id
-		// has to survive it, carried by the seed lease and the peers rather
-		// than by anything on disk.
+		// **One instance at a time, not the whole tier.** Rolling the revision
+		// outright was the first version of this, and it asserted something the
+		// platform cannot do: Cloud Run replaces every instance of a worker pool
+		// at once, and with three ephemeral disks discarded together there is
+		// nothing left to carry the cluster. The seed lease carries an address,
+		// not cluster state, and PD cannot be told to adopt an id -- so a fresh
+		// tier bootstraps a fresh cluster, correctly. The run that found this
+		// went from id ...4512 to ...0939 and sat waiting for a third replica
+		// that had nothing to join.
+		//
+		// So: deploy the revision unpromoted, then move a third of the instances
+		// -- one of three -- onto it. Two members survive, quorum holds, and the
+		// replacement has a cluster to join. That is the same claim the ECS
+		// suite makes by stopping one task, and it is the strongest one that is
+		// true here.
 		before, err := s.latestReports(ctx, s.pdPool, "pd: CLUSTER")
 		if err != nil || len(before) == 0 {
 			t.Fatalf("read cluster id before: %v", err)
@@ -234,57 +245,83 @@ func TestTiKVOnCloudRun(t *testing.T) {
 			wantID = info.ID
 			break
 		}
-		t.Logf("cluster id before the roll: %d", wantID)
+		t.Logf("cluster id before the replacement: %d", wantID)
 
 		rolled := time.Now()
+		// --no-promote leaves the new revision with no instances at all, which
+		// is what makes the move below a replacement rather than a turnover.
 		if err := harness.Run(t, "gcloud", "beta", "run", "worker-pools", "update", s.pdPool,
-			"--project="+s.project, "--region="+s.region,
+			"--project="+s.project, "--region="+s.region, "--no-promote",
 			"--update-env-vars=MUSTER_ROLL="+fmt.Sprint(rolled.Unix()), "--quiet"); err != nil {
-			t.Fatalf("roll the PD pool: %v", err)
+			t.Fatalf("deploy the replacement revision: %v", err)
 		}
 
-		harness.Eventually(t, "PD pool ready again", 20*time.Minute, 20*time.Second,
-			func(ctx context.Context) error { return s.poolReady(ctx, s.pdPool) })
+		raw, err := s.describePool(ctx, s.pdPool)
+		if err != nil {
+			t.Fatalf("describe the PD pool: %v", err)
+		}
+		next, err := cloudrun.CreatedRevision(raw)
+		if err != nil {
+			t.Fatalf("name the new revision: %v", err)
+		}
+		t.Logf("replacing one of %d instances with revision %s", s.pdWant, next)
 
-		harness.Eventually(t, "the same cluster came back", 20*time.Minute, 20*time.Second,
+		// 34%% of three instances is one. The other two stay where they are.
+		if err := harness.Run(t, "gcloud", "beta", "run", "worker-pools", "update-instance-split",
+			s.pdPool, "--project="+s.project, "--region="+s.region,
+			"--to-revisions="+next+"=34", "--quiet"); err != nil {
+			t.Fatalf("move one instance onto %s: %v", next, err)
+		}
+
+		harness.Eventually(t, "the replacement rejoined the same cluster", 20*time.Minute, 20*time.Second,
 			func(ctx context.Context) error {
-				// The revision the roll produced, so the replicas that were
-				// replaced cannot answer for the ones that replaced them.
-				raw, err := s.describePool(ctx, s.pdPool)
+				// Deliberately not scoped to a revision: during the split the
+				// survivors are on the old one and the replacement on the new,
+				// and both are members of the cluster under test. The window
+				// starts at the replacement, which is what keeps earlier
+				// generations out.
+				entries, err := s.logEntries(ctx, s.pdPool, "", time.Since(rolled)+2*time.Minute, 4000)
 				if err != nil {
 					return err
 				}
-				revision, err := cloudrun.ReadyRevision(raw)
-				if err != nil {
-					return err
-				}
-				entries, err := s.logEntries(ctx, s.pdPool, revision, time.Since(rolled)+2*time.Minute, 4000)
-				if err != nil {
-					return err
-				}
-				seen := map[string]int64{}
+
+				// Checked before the count, and terminal: a replica that
+				// bootstrapped its own cluster will never converge, and waiting
+				// out the timeout turns the one failure this test exists to
+				// catch into "2 of 3 replicas have reported" -- which is what it
+				// did say, for twenty minutes, while the answer was already in
+				// front of it.
 				for who, r := range cloudrun.LatestReports(entries, "pd: CLUSTER") {
 					var info pdClusterInfo
 					if json.Unmarshal([]byte(r.Body), &info) != nil {
 						continue
 					}
-					seen[who] = info.ID
+					if info.ID != wantID {
+						return fmt.Errorf("%w: %s reports cluster id %d, want %d -- "+
+							"it bootstrapped a new cluster instead of joining",
+							harness.ErrTerminal, who, info.ID, wantID)
+					}
 				}
-				if len(seen) < s.pdWant {
-					return fmt.Errorf("%d of %d replacements have reported", len(seen), s.pdWant)
+
+				// The replacement has to be *in* the group, not merely agreeing
+				// about which group it is: a member that never rejoined leaves
+				// the cluster a member short and one failure from losing quorum.
+				reports := cloudrun.LatestReports(entries, "pd: MEMBERS")
+				if len(reports) == 0 {
+					return fmt.Errorf("no replica has reported its membership since the replacement")
 				}
-				for who, id := range seen {
-					if id != wantID {
-						// Terminal: a replacement that bootstrapped its own
-						// cluster will never converge, and waiting out the
-						// timeout only delays the report.
-						return fmt.Errorf("%w: %s reports cluster id %d, want %d — "+
-							"the replacement bootstrapped a new cluster",
-							harness.ErrTerminal, who, id, wantID)
+				for who, r := range reports {
+					var m pdMembers
+					if json.Unmarshal([]byte(r.Body), &m) != nil {
+						continue
+					}
+					if len(m.Members) != s.pdWant {
+						return fmt.Errorf("%s sees %d members (%v), want %d",
+							who, len(m.Members), m.names(), s.pdWant)
 					}
 				}
 				return nil
 			})
-		t.Logf("the PD tier rolled and stayed on cluster %d", wantID)
+		t.Logf("one PD instance was replaced and the cluster stayed %d", wantID)
 	})
 }

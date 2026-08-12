@@ -221,15 +221,36 @@ func (s *stack) latestReports(ctx context.Context, pool, msg string) (map[string
 	return cloudrun.LatestReports(entries, msg), nil
 }
 
+// dumpLogs prints muster's own decisions first and the workload's output after.
+//
+// The order is the point. A flat tail is dominated by the workload -- PD alone
+// writes thousands of lines an hour, so the last three hundred cover about a
+// minute and contain nothing muster did. Every line muster wrote across the
+// whole window fits in a fraction of that, and it is the half that explains
+// which branch a replica took.
 func (s *stack) dumpLogs(t *testing.T, pool string, limit int) {
 	t.Helper()
-	entries, err := s.logEntries(context.Background(), pool, "", 60*time.Minute, limit)
+	// Deliberately unscoped: after a failure you want every generation, not the
+	// one that happens to be current.
+	entries, err := s.logEntries(context.Background(), pool, "", 60*time.Minute, 4000)
 	if err != nil {
 		t.Logf("could not read logs for %s: %v", pool, err)
 		return
 	}
-	t.Logf("--- last %d log lines for %s ---", limit, pool)
-	for _, e := range entries {
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Timestamp < entries[j].Timestamp })
+
+	decisions := cloudrun.Decisions(entries)
+	t.Logf("--- %s: what muster decided (%d lines) ---", pool, len(decisions))
+	for _, e := range decisions {
+		t.Logf("  | %s", e)
+	}
+
+	workload := cloudrun.Workload(entries)
+	if len(workload) > limit {
+		workload = workload[len(workload)-limit:]
+	}
+	t.Logf("--- %s: last %d lines from the workload ---", pool, len(workload))
+	for _, e := range workload {
 		t.Logf("  | %s", e)
 	}
 }

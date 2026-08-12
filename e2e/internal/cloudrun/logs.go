@@ -84,6 +84,44 @@ func ParseEntries(raw []byte) ([]LogEntry, error) {
 // RevisionLabel is where an entry records the revision whose instance wrote it.
 const RevisionLabel = "revision_name"
 
+// IsReport reports whether an entry is one of the periodic self-reports. They
+// are the assertions' input and a failure dump's noise: each carries a whole PD
+// API response, so a handful of them crowds out everything else.
+func (e LogEntry) IsReport() bool {
+	return strings.HasPrefix(e.JSON.Msg, "pd: CLUSTER") ||
+		strings.HasPrefix(e.JSON.Msg, "pd: MEMBERS") ||
+		strings.HasPrefix(e.JSON.Msg, "pd: STORES")
+}
+
+// Decisions returns the lines muster itself wrote, minus the periodic reports:
+// which branch resolve() took, what it registered, what it respawned and why.
+//
+// These are what a failure dump is for, and they are also the rarest lines in
+// it. PD emits thousands of lines an hour, so a dump of the last few hundred
+// covers a minute or two of raft chatter and reaches nothing muster decided --
+// which is exactly what happened the first time this suite failed for a reason
+// worth reading.
+func Decisions(entries []LogEntry) []LogEntry {
+	var out []LogEntry
+	for _, e := range entries {
+		if e.JSON.Msg != "" && !e.IsReport() {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// Workload returns the lines the supervised process wrote itself.
+func Workload(entries []LogEntry) []LogEntry {
+	var out []LogEntry
+	for _, e := range entries {
+		if e.Text != "" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // LatestReports returns the most recent report of the given kind per replica,
 // keyed on the address the replica reported about itself.
 //

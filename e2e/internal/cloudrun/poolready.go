@@ -51,6 +51,19 @@ func ReadyRevision(raw []byte) (string, error) {
 	return p.Status.LatestReady, nil
 }
 
+// CreatedRevision names the revision a pool most recently created, which after
+// an unpromoted deploy is the one carrying no instances yet.
+func CreatedRevision(raw []byte) (string, error) {
+	var p pool
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return "", fmt.Errorf("parsing describe output: %w", err)
+	}
+	if p.Status.LatestCreated == "" {
+		return "", fmt.Errorf("no created revision in the describe output")
+	}
+	return p.Status.LatestCreated, nil
+}
+
 // PoolReady reports whether a worker pool has reconciled onto a ready revision,
 // given the JSON `gcloud run worker-pools describe` produced for it. A worker
 // pool serves no requests, so this is the only signal that its instances were

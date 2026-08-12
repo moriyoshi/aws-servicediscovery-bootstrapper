@@ -86,13 +86,22 @@ what the ECS suite achieves by shelling into each task.
 | `QuorumComplete` | Every replica sees the full membership — not just one of them. A member that formed its own view is a split brain one level down. |
 | `StoresUp` | PD knows exactly the expected stores, all `Up`. |
 | `SeedLease` | The lease is released, or held by a registered replica. |
-| `PDReplacementRejoins` | Rolls the PD revision, replacing **every** instance, and requires the cluster id to survive. Skipped under `go test -short`. |
+| `PDReplacementRejoins` | Replaces **one** PD instance and requires the cluster id — and the membership count — to survive. Skipped under `go test -short`. |
 
-`PDReplacementRejoins` is deliberately blunter than the ECS version, which stops
-one task. Here the whole PD tier turns over at once, and the cluster id has to
-survive carried by the seed lease and the peers rather than by anything on disk
-— which is the strongest statement this platform allows, since nothing on disk
-outlives an instance.
+`PDReplacementRejoins` replaces one instance of three, which is the same claim
+the ECS version makes by stopping one task — and it took a failed run to arrive
+at. Rolling the revision outright, which is what it did first, asserts something
+Cloud Run cannot do: a revision update replaces *every* instance of a worker
+pool, and with three ephemeral disks discarded together nothing is left to carry
+the cluster. The seed lease carries an address, not cluster state, and PD cannot
+be told to adopt an id, so a fresh tier correctly bootstraps a fresh cluster.
+
+Hence `--no-promote` followed by `update-instance-split --to-revisions=<new>=34`:
+the new revision takes one instance of three, two members survive, quorum holds,
+and the replacement has something to join. A mismatched cluster id fails
+immediately rather than waiting out the timeout — that is the one failure this
+subtest exists to catch, and the first version reported it as "2 of 3 replicas
+have reported".
 
 ## Running it
 
@@ -144,7 +153,10 @@ pushes, `apply` does the rest.
 ## Debugging
 
 `MUSTER_E2E_TIKV_GCP_KEEP=1` leaves the stack up after a failure, and the
-harness dumps both pools' logs before teardown removes them.
+harness dumps both pools' logs before teardown removes them — **muster's own
+decisions first**, in full, then a bounded tail of the workload's output. A flat
+tail is useless here: PD writes thousands of lines an hour, so the last few
+hundred cover about a minute of raft chatter and reach nothing muster did.
 
 The self-reports are the first place to look. Each is one line:
 
