@@ -484,48 +484,29 @@ type, the revision label and both payload shapes are pinned against real data
 instead of against my memory of an API. Verified against the live cluster as
 well: three replicas, one cluster id, from the current revision only.
 
-### The suite runs, and the last subtest asserted the impossible
+### Replacing one PD instance, four attempts
 
-Seven of eight subtests pass against a real project: `PoolsReachReady`,
-`ServiceDirectoryRegistrations`, `PDClusterBootstrapped`, `NoSplitBrain`,
-`QuorumComplete`, `StoresUp`, `SeedLease`. Everything the provider exists to do,
-end to end, on Cloud Run worker pools.
+Seven of the eight subtests passed the first time the suite ran end to end and
+have passed every run since. The eighth took four attempts, and what it kept
+teaching was not about muster.
 
-`PDReplacementRejoins` failed, and it was right to. It rolled the PD revision
-and required the cluster id to survive — but **a Cloud Run revision update
-replaces every instance of a worker pool**, and with three ephemeral disks
-discarded together there is nothing left to carry the cluster. The seed lease
-carries an address, not cluster state, and PD cannot be told to adopt an id. So
-the new tier bootstrapped a new cluster, correctly: id ...4512 before, ...0939
-after. The test asserted a property the platform cannot provide, and the README
-called it "the strongest statement this platform allows" while it was in fact a
-statement about a different platform — Fargate, where the ECS suite stops *one*
-task.
+**Attempt 1 — roll the revision.** A Cloud Run revision update replaces *every*
+instance of a worker pool, and with three ephemeral disks discarded together
+there is nothing left to carry the cluster: the seed lease holds an address, not
+cluster state, and PD cannot be told to adopt an id. So the new tier bootstrapped
+a new cluster, correctly — id ...4512 before, ...0939 after. The test asserted a
+property of Fargate, where the ECS suite stops *one* task.
 
-The fix is to make the same claim the ECS suite makes: `--no-promote` to deploy
-the revision with no instances, then `update-instance-split --to-revisions=
-<new>=34` to move one instance of three onto it. Two members survive, quorum
-holds, and the replacement has a cluster to join. It also now asserts membership
-returns to three, because agreeing about which cluster you are in is not the
-same as being in it.
-
-**How it failed is the more useful half.** The mismatched cluster id was visible
-in the very first poll, and the check said `2 of 3 replacements have reported`
-for twenty minutes instead, because it counted replicas before comparing what
-they said. A test whose single purpose is catching a split brain reported a
-split brain as a timeout. The comparison now runs first and is terminal.
-
-And the failure dump could not have explained any of it: 300 lines of a pool
+Two things about how it reported that were worse than the failure. The
+mismatched id was visible in the first poll, but the check counted replicas
+before comparing what they said, so the one failure this subtest exists to catch
+appeared as `2 of 3 replicas have reported` followed by a twenty-minute timeout.
+And the dump could not have explained it either: three hundred lines of a pool
 where PD writes thousands an hour is about ninety seconds of raft chatter, with
-none of muster's decisions in it. Dumps now print every line muster wrote —
-which branch each replica took, what it registered, what it respawned — and then
-a bounded tail of the workload's own output. Everything muster says across an
-hour fits in a fraction of what the workload says in a minute.
+none of muster's decisions in it.
 
-### The replacement worked; the assertion was reading a ghost
-
-With the one-instance replacement in place, muster did the whole thing
-correctly, and the dump built for the previous failure is what showed it:
+**Attempt 2 — deploy unpromoted, move a third of the instances.** muster did
+this correctly, and the dump built for attempt 1 is what showed it:
 
 ```
 04:07:09  pd: joining the running cluster   name="pd-10-128-253-22"
@@ -534,69 +515,60 @@ correctly, and the dump built for the previous failure is what showed it:
 04:07:28  workload torn down
 ```
 
-The replacement joined, the instance being replaced evicted itself from the
-Raft group **inside Cloud Run's ten-second budget** — the thing this platform
-was most likely to make impossible — and the cluster id never changed. That is
-the whole subtest, satisfied.
+The replacement joined, the departing instance evicted itself from the Raft
+group **inside Cloud Run's fixed ten-second budget** — the platform constraint
+most likely to be fatal here — and the cluster id never moved.
 
-It failed anyway, on `10.128.253.16 sees 4 members ... want 3`, repeated for
-twenty minutes. `.16` is the replica that *was replaced*. Its last MEMBERS
-report was filed mid-handover, with `.22` already joined and itself not yet
-evicted — four members, correctly — and then it was gone. `LatestReports`
-returns the newest report per replica, so that one stands forever, and a check
-requiring every reporter to agree can never pass.
+It failed on `10.128.253.16 sees 4 members ... want 3`, for twenty minutes.
+`.16` is the replica that was replaced: its last report was filed mid-handover,
+with the replacement joined and itself not yet evicted, and then it was gone.
+`LatestReports` returns the newest report *per replica*, so that one stands
+forever. **A self-report outlives the replica that wrote it** — the third time
+that cost a run, after two that revision scoping had answered. This one needed
+liveness instead, because during a replacement the survivors and the replacement
+are legitimately on different revisions, and muster already publishes liveness:
+Service Directory, withdrawn by the same `pre_stop` that evicts the member.
+Scoping to registered replicas also let the assertion compare member *names*
+rather than count them, so a group that swapped an evicted member for a stale one
+now fails instead of reaching three.
 
-This is the third appearance of one idea: **a self-report outlives the replica
-that wrote it.** Revision scoping fixed the first two, and cannot fix this one,
-because during a split the survivors and the replacement are legitimately on
-different revisions. The right filter is liveness, and muster already publishes
-it — Service Directory, withdrawn by the same `pre_stop` that evicts the member.
+**Attempt 3 — the same split, and the platform disagreed again.** Four replicas
+registered themselves and stayed. Under `MANUAL` scaling the instance count is
+honoured **per revision**, so the pool ran the old revision's three alongside the
+new one's one. Attempt 1 asserted something the platform cannot do; attempt 3
+assumed something it does differently. Both were wrong about the same thing —
+what a worker pool does when you ask it to change.
 
-Scoping to registered replicas also made the assertion stronger than the count
-it replaced. It now compares the reported member names against the registered
-addresses, so a group that swapped an evicted member for a stale one — exactly
-what `pre_stop` exists to prevent — fails instead of counting to three.
+Two genuine bugs surfaced there, neither one the test was looking for.
 
-### Replacing one instance, third attempt — and two real bugs behind it
+`pd_pre_stop` **skipped `deregister()` when a peer was already gone.**
+`http_request` raises on a transport error, Starlark cannot catch it, so a failed
+member DELETE aborted the rest of `pre_stop`. The instance left its Service
+Directory endpoint behind: the cluster was fine and *discovery* was not, which is
+the worse of the two, because every peer that later reads discovery believes in a
+replica that is gone. Contained the same way as the reporting loop — each
+fallible step on its own task, awaited with `select()`. That is now the third
+place in one script where the fix is "a raise must not escape", which is worth
+stating as a rule: **in Starlark, containment is structural or it does not
+exist.**
 
-The instance split does not replace an instance. Under `MANUAL` scaling the
-count is honoured **per revision**, so `--no-promote` plus
-`update-instance-split --to-revisions=<new>=34` left the pool running the old
-revision's three *and* the new one's one: four replicas registered, for twenty
-minutes. The first attempt (roll the revision) asserted something the platform
-cannot do; the second asserted something the platform does differently than
-documented. Both were wrong about the same thing — what a Cloud Run worker pool
-does when you ask it to change.
+And muster **reported a lost task failure on every clean shutdown**. The
+unobserved-rejection warning fired for background loops cancelled during
+teardown, which had not failed — they were stopped. It stays quiet now when the
+parent context is already done. A diagnostic that cries wolf at every shutdown is
+unlearned within a week, which would have cost more than it ever saved.
 
-The instance count is on the pool, not the revision template, so it scales in
-place and rolls nothing: **3 → 2 → 3**. Down, an instance stops and `pre_stop`
-must evict its member; up, a new instance joins at a new address with an empty
-disk. That is the ECS claim, and now both halves are asserted.
+The dump was empty again too, for a new reason: `--limit` bounds what a Cloud
+Logging query *returns*, not what matches it, and four thousand entries from the
+PD pool cover about fifteen seconds. Selecting muster's lines from that in Go
+means they were never fetched. The filter is server-side now.
 
-Two genuine bugs surfaced on the way, neither of which the test was looking for.
-
-**`pd_pre_stop` skipped `deregister()` when a peer was already gone.**
-`http_request` raises on a transport error, Starlark cannot catch it, so a
-failed member DELETE aborted the rest of `pre_stop` — including the
-deregistration. The instance left its Service Directory endpoint behind: the
-cluster was fine and *discovery* was not, which is the worse of the two, because
-every peer that later reads discovery believes in a replica that is gone. Same
-containment as the reporting loop: each fallible step on its own task, awaited
-with `select()`. This is the third place in one script where the fix is "a raise
-must not escape", which is worth stating as a rule — **in Starlark, containment
-is structural or it does not exist.**
-
-**muster reported a lost task failure on every clean shutdown.** The
-unobserved-rejection warning added earlier fired for background loops cancelled
-during teardown, which had not failed at all — they were stopped. It now stays
-quiet when the parent context is already done. A diagnostic that cries wolf at
-every shutdown would have been unlearned within a week.
-
-And the failure dump was empty again, for a new reason: `--limit` bounds what the
-query *returns*, not what matches, and four thousand entries from the PD pool
-cover about fifteen seconds. Filtering muster's lines out of that in Go means the
-lines worth having were never fetched. The filter is now server-side, so the
-limit is spent on the lines being asked for.
+**Attempt 4 — the instance count.** It lives on the pool rather than the revision
+template, so changing it scales in place and rolls nothing: **3 → 2 → 3**. Going
+down, an instance stops and `pre_stop` must evict its member inside the ten
+seconds. Coming back up, a new instance appears at a new address with an empty
+disk and must join rather than bootstrap. That is the ECS claim, both halves are
+asserted, and it is unrun at the time of writing.
 
 ### Verified
 
@@ -606,6 +578,9 @@ limit is spent on the lines being asked for.
 - Dependency isolation asserted in both directions (see above).
 - KV conformance (13 subtests) green against `memKV`, `gcsKV` and — via the
   emulator in Docker — `firestoreKV`.
+- `pre_stop` evicting a PD member from the Raft group inside Cloud Run's fixed
+  ten-second budget, observed in production. This was the platform difference
+  most likely to make the whole exercise impossible.
 - Every startup error path smoke-tested against the real binaries: absent
   provider, nothing to autodetect, removed flag, cross-cloud autodetect,
   unknown `-provider-opt`.
@@ -631,7 +606,7 @@ the table is read off the live stack rather than inferred:
 | `QuorumComplete` | each sees 3 members, not just itself |
 | `StoresUp` | 3 stores, `['Up', 'Up', 'Up']`, from each replica independently |
 | `SeedLease` | held by `10.128.253.18`, which is a registered replica |
-| `PDReplacementRejoins` | **failed three times, never for muster's reasons** — see below |
+| `PDReplacementRejoins` | **four attempts, still unproven** — see below; three were the harness, the fourth is unrun |
 
 Seed election is the part the whole provider exists for, and on Cloud Run it is
 no longer theoretical: from a cold start one replica took the lease and
@@ -644,24 +619,31 @@ first samples; and the last run's dump shows a replaced replica evicting itself
 from the Raft group inside Cloud Run's ten-second budget, which was the platform
 constraint most likely to be fatal.
 
-**Nine distinct failures have cost a provision, and not one was the election.**
+**Ten distinct failures have cost a provision, and not one was the election.**
 In order: registry authentication; a configuration variable nothing read; the
 reporting loop's silent death; TiKV's file-descriptor demand; a readiness check
 reading the wrong API's field names; three stacked defects in the log reads; an
 assertion the platform cannot satisfy; a repository check that swallowed an
-expired credential and blamed a missing repository; and a stale self-report from
-a replica that had been replaced.
+expired credential and blamed a missing repository; a stale self-report from a
+replica that had been replaced; and an instance split that added a fourth
+replica instead of replacing one.
 
-Six of the nine were **silent** — an empty result, an unread variable, a
+Seven of the ten were **silent** — an empty result, an unread variable, a
 discarded error, a log with nothing in it, a message with only one thing it
 could say. That is the finding this suite produced, more than any individual
 bug: on this platform the expensive failures are not the ones that shout.
 
-Three of the nine were in the *observation* of the cluster rather than the
-cluster, and all three were the same idea arriving in different clothes — **a
-self-report outlives the replica that wrote it.** Revision scoping answered the
-first two; the third needed liveness, because during a rolling replacement the
-survivors and the replacement are legitimately on different revisions.
+Three were in the *observation* of the cluster rather than the cluster, and all
+three were the same idea in different clothes — **a self-report outlives the
+replica that wrote it.** Revision scoping answered the first two; the third
+needed liveness, because during a replacement the survivors and the replacement
+are legitimately on different revisions.
+
+Three more were **wrong about the platform rather than about muster**: what a
+revision update does to a worker pool, what an instance split does under manual
+scaling, and what `--limit` bounds in a Cloud Logging query. Each was a
+confident assumption that read plausibly and cost a provision to disprove, and
+each is now pinned by a fixture or written down here.
 
 Still not verified, and needing infrastructure:
 
@@ -675,11 +657,11 @@ Still not verified, and needing infrastructure:
   single-process and cannot reproduce contention, retries, or the per-object
   write rate. The same gap applies to Firestore, where the emulator stands in
   for the server whose transaction semantics are the thing under test.
-- **`PDReplacementRejoins` has never completed.** Its three failures were an
-  assertion the platform cannot satisfy and then a stale-reporter artefact, and
-  the underlying behaviour looked correct in the logs each time — but "looked
-  correct in the logs" is not the same as a green run, and the fix for the last
-  one is itself unexercised.
+- **`PDReplacementRejoins` has never completed**, across four attempts. Three
+  failed on the harness rather than on muster, and the behaviour looked correct
+  in the logs each time — a replacement joining, a departing member evicting
+  itself inside the ten-second budget, the cluster id unmoved. But "looked
+  correct in the logs" is not a green run, and the fourth approach is unrun.
 - The **Firestore backend against a real database** (`KV_BACKEND=firestore`) is
   the other Google Cloud path no run has touched.
 
@@ -722,11 +704,16 @@ failure there means the provider work broke something rather than that new
 infrastructure code is wrong. It also now carries a change of its own: `me()`
 reads `SELF.ipv4` rather than `ifaddr()`, which has not been near Fargate.
 
-Then `e2e/tikv/gcp`, which needs one clean pass rather than another repair. Seven
-subtests pass reliably; `PDReplacementRejoins` is the only one left, its last two
-failures were the harness rather than muster, and the ten-second shutdown budget
-— the thing most likely to defeat this platform — has now been observed working:
-a replaced replica evicted itself from the Raft group in under a second.
+Then `e2e/tikv/gcp`. Seven subtests pass reliably; `PDReplacementRejoins` is the
+only one left, and its four attempts are documented above so the next person does
+not rediscover the same three platform facts. The ten-second shutdown budget —
+the thing most likely to defeat this platform — has been observed working: a
+replaced replica evicted itself from the Raft group in under a second.
+
+If attempt 4 also fails, the question to ask first is what a worker pool actually
+did, not what muster decided. That has been the answer three times out of four,
+and `make logs-pd` now shows muster's decisions in full rather than a minute of
+raft chatter.
 
 Two habits are worth carrying into whatever comes next, because they are what
 the nine failures actually taught:
