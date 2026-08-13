@@ -87,12 +87,35 @@ auth: check-registry
 # The repository has to exist before a push, and a push to a missing one fails
 # with the same "(or it may not exist)" message as an auth failure. Checking
 # separates the two.
+#
+# --location is right, whatever a nearby Cloud Run command suggests: Artifact
+# Registry and Service Directory are regional resources addressed by --location,
+# while `gcloud run` takes --region. Passing --region here is what produces
+# "unrecognized arguments".
+#
+# gcloud's own error is printed rather than swallowed, and only a genuine
+# not-found is blamed on a missing repository. Discarding it cost a provision:
+# terraform had just reported the repository present, this said it did not
+# exist, and the actual cause was an expired credential -- which the message
+# named nowhere, because it could only ever say one thing.
 .PHONY: check-repo
 check-repo: check-registry
-	@gcloud artifacts repositories describe "$(AR_REPOSITORY)" \
-		--project="$(GCP_PROJECT)" --location="$(GCP_REGION)" >/dev/null 2>&1 || { \
-		echo "Artifact Registry repository '$(AR_REPOSITORY)' does not exist in" >&2; \
-		echo "$(GCP_PROJECT)/$(GCP_REGION). Run 'make bootstrap' from e2e/tikv/gcp." >&2; \
+	@out=$$(gcloud artifacts repositories describe "$(AR_REPOSITORY)" \
+		--project="$(GCP_PROJECT)" --location="$(GCP_REGION)" 2>&1) || { \
+		echo "$$out" >&2; \
+		echo "" >&2; \
+		case "$$out" in \
+		*"not found"*|*NOT_FOUND*|*"does not exist"*) \
+			echo "Artifact Registry repository '$(AR_REPOSITORY)' does not exist in" >&2; \
+			echo "$(GCP_PROJECT)/$(GCP_REGION). Run 'make bootstrap' from e2e/tikv/gcp." >&2 ;; \
+		*"Reauthentication"*|*"auth"*|*"credential"*) \
+			echo "gcloud could not authenticate. Run 'gcloud auth login' -- a session" >&2; \
+			echo "that expires mid-run reports here first, because this is the first" >&2; \
+			echo "thing after terraform to call the API." >&2 ;; \
+		*) \
+			echo "Could not check the Artifact Registry repository. The error above is" >&2; \
+			echo "gcloud's own; this is not necessarily a missing repository." >&2 ;; \
+		esac; \
 		exit 1; }
 
 .PHONY: push

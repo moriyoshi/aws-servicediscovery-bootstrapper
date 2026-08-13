@@ -604,6 +604,16 @@ Two things that cost time and are not findings about muster:
 - **The branch requires signed commits.** `commit.gpgsign` was not set in this
   repository, `gpg.format=ssh` and `user.signingkey` were, so commits were
   simply unsigned and the PR was unmergeable. It is now set local to the repo.
+- **`--location`, not `--region`, for Artifact Registry and Service Directory.**
+  `gcloud run` takes `--region`; these take `--location`, and passing the wrong
+  one produces "unrecognized arguments". Both are regional; only the spelling
+  differs, and a suite that touches all three surfaces mixes them up.
+- **A check that can only say one thing will say it when it is wrong.**
+  `check-repo` discarded gcloud's stderr and reported "the repository does not
+  exist. Run make bootstrap" — one provision after terraform had reported the
+  repository present, with an expired credential as the actual cause. It now
+  prints gcloud's own error first and blames a missing repository only when
+  gcloud said so.
 - **`docker login` normalises a path-qualified registry to its host**, which is
   why one variable is enough for both the Artifact Registry login and the image
   tags, and why an earlier two-variable version had one of them empty after a
