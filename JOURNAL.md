@@ -568,7 +568,7 @@ template, so changing it scales in place and rolls nothing: **3 → 2 → 3**. G
 down, an instance stops and `pre_stop` must evict its member inside the ten
 seconds. Coming back up, a new instance appears at a new address with an empty
 disk and must join rather than bootstrap. That is the ECS claim, both halves are
-asserted, and it is unrun at the time of writing.
+asserted, and this is the approach that passes.
 
 ### Verified
 
@@ -578,6 +578,8 @@ asserted, and it is unrun at the time of writing.
 - Dependency isolation asserted in both directions (see above).
 - KV conformance (13 subtests) green against `memKV`, `gcsKV` and — via the
   emulator in Docker — `firestoreKV`.
+- **Both end-to-end suites, against real infrastructure.** `e2e/tikv/aws` on
+  ECS Fargate and `e2e/tikv/gcp` on Cloud Run worker pools, every subtest.
 - `pre_stop` evicting a PD member from the Raft group inside Cloud Run's fixed
   ten-second budget, observed in production. This was the platform difference
   most likely to make the whole exercise impossible.
@@ -588,14 +590,18 @@ asserted, and it is unrun at the time of writing.
   ("kv store not configured", "ECS client not configured" → now
   "replica status not configured").
 
-### What the real Cloud Run runs proved, and what they did not
+### Both suites pass
 
-The Google Cloud stack **has been applied**, repeatedly, against a real project.
-That settles the most important claim in this document, and most of the others.
+**`e2e/tikv/gcp` is green, all eight subtests**, and **`e2e/tikv/aws` is green**
+— which between them settle every claim this document was carrying on trust.
 
-**A complete TiKV cluster now runs on Cloud Run worker pools, assembled by
-muster.** Seven of the eight subtests have passed in each of the last two runs;
-the table is read off the live stack rather than inferred:
+The AWS run is the regression gate: it is what proves the provider refactor did
+not break seed election on the platform that already worked, and it also carries
+a change of its own, `me()` reading `SELF.ipv4` instead of `ifaddr()`, which had
+never been near Fargate until now.
+
+The Google Cloud run is the new claim. A complete TiKV cluster — three PD
+replicas and three stores — assembled by muster on Cloud Run worker pools:
 
 | Assertion | Live state |
 | --- | --- |
@@ -606,11 +612,13 @@ the table is read off the live stack rather than inferred:
 | `QuorumComplete` | each sees 3 members, not just itself |
 | `StoresUp` | 3 stores, `['Up', 'Up', 'Up']`, from each replica independently |
 | `SeedLease` | held by `10.128.253.18`, which is a registered replica |
-| `PDReplacementRejoins` | **four attempts, still unproven** — see below; three were the harness, the fourth is unrun |
+| `PDReplacementRejoins` | **passes** on the fourth approach — scale to 2 and back to 3; see below |
 
 Seed election is the part the whole provider exists for, and on Cloud Run it is
 no longer theoretical: from a cold start one replica took the lease and
-bootstrapped, two followed it, and every replica agrees on one cluster.
+bootstrapped, two followed it, and every replica agrees on one cluster. A
+replacement then joined that same cluster rather than starting its own, with the
+departing member evicted inside a ten-second budget.
 
 Several fixes are confirmed in production by that table rather than by argument:
 the store tier is up, so the file-descriptor config works; the numbers were
@@ -647,28 +655,24 @@ each is now pinned by a fixture or written down here.
 
 Still not verified, and needing infrastructure:
 
-- **`-tags=e2e_tikv`** (Terraform + Fargate TiKV): compiles and vets, not run.
-  **This is the real regression gate for the refactor** — `NoSplitBrain` and
-  `SeedLease` are what prove seed election survived. Worth running before merge,
-  and now doubly so, since the AWS scripts changed after it last passed.
 - **`-tags=e2e`** (Winterbäume emulator): compiles and vets, not run. Now runs
-  the shared conformance suite against the real DynamoDB store.
+  the shared conformance suite against the real DynamoDB store. The least
+  pressing of these, since both real clusters pass.
 - **`-tags=gcp,gcp_live`**: skips without `MUSTER_GCP_KV_BUCKET`. The fake is
   single-process and cannot reproduce contention, retries, or the per-object
   write rate. The same gap applies to Firestore, where the emulator stands in
   for the server whose transaction semantics are the thing under test.
-- **`PDReplacementRejoins` has never completed**, across four attempts. Three
-  failed on the harness rather than on muster, and the behaviour looked correct
-  in the logs each time — a replacement joining, a departing member evicting
-  itself inside the ten-second budget, the cluster id unmoved. But "looked
-  correct in the logs" is not a green run, and the fourth approach is unrun.
 - The **Firestore backend against a real database** (`KV_BACKEND=firestore`) is
   the other Google Cloud path no run has touched.
 
 ### Deferred
 
-- Stale Service Directory endpoint reaping (an instance killed without teardown
-  leaves its entry). Scripts already probe peers before trusting them.
+- Stale Service Directory endpoint reaping (an instance killed *without*
+  teardown leaves its entry). One that gets its ten seconds now withdraws its
+  own, since `pre_stop` no longer loses the deregistration to a failed member
+  eviction. Scripts probe peers before trusting them regardless.
+- The Firestore backend against a real database. It satisfies the conformance
+  suite on the emulator and has never met the server.
 - Azure. The seam accommodates it; nothing else was done.
 - Renaming the working directory to `~/Source/muster`. Zero diff — the module
   path and GitHub remote are already `github.com/moriyoshi/muster` — but it
@@ -698,22 +702,20 @@ Two things that cost time and are not findings about muster:
 
 ### If you pick this up next
 
-Run `e2e/tikv/aws` first. It is the regression gate for the whole refactor —
-`NoSplitBrain` and `SeedLease` are what prove seed election survived — and a
-failure there means the provider work broke something rather than that new
-infrastructure code is wrong. It also now carries a change of its own: `me()`
-reads `SELF.ipv4` rather than `ifaddr()`, which has not been near Fargate.
+Both suites pass, so there is nothing outstanding to repair. What is left is
+work nobody has started:
 
-Then `e2e/tikv/gcp`. Seven subtests pass reliably; `PDReplacementRejoins` is the
-only one left, and its four attempts are documented above so the next person does
-not rediscover the same three platform facts. The ten-second shutdown budget —
-the thing most likely to defeat this platform — has been observed working: a
-replaced replica evicted itself from the Raft group in under a second.
+- **The Firestore backend against a real database.** `KV_BACKEND=firestore make
+  e2e` is wired and has never run; the emulator stands in for the server whose
+  transaction semantics are the thing being relied on.
+- **Azure.** The seam accommodates it and nothing else was done.
+- **`-tags=e2e`**, the Winterbäume emulator suite, which now runs the shared
+  conformance suite against the real DynamoDB store.
 
-If attempt 4 also fails, the question to ask first is what a worker pool actually
-did, not what muster decided. That has been the answer three times out of four,
-and `make logs-pd` now shows muster's decisions in full rather than a minute of
-raft chatter.
+If a Cloud Run run does fail, the question to ask first is what the worker pool
+actually did, not what muster decided. That was the answer to three failures out
+of four, and `make logs-pd` now shows muster's decisions in full rather than a
+minute of raft chatter.
 
 Two habits are worth carrying into whatever comes next, because they are what
 the nine failures actually taught:
