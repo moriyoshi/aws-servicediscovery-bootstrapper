@@ -522,6 +522,41 @@ which branch each replica took, what it registered, what it respawned — and th
 a bounded tail of the workload's own output. Everything muster says across an
 hour fits in a fraction of what the workload says in a minute.
 
+### The replacement worked; the assertion was reading a ghost
+
+With the one-instance replacement in place, muster did the whole thing
+correctly, and the dump built for the previous failure is what showed it:
+
+```
+04:07:09  pd: joining the running cluster   name="pd-10-128-253-22"
+04:07:26  running pre_stop
+04:07:27  pd: dropped member                name="pd-10-128-253-16"
+04:07:28  workload torn down
+```
+
+The replacement joined, the instance being replaced evicted itself from the
+Raft group **inside Cloud Run's ten-second budget** — the thing this platform
+was most likely to make impossible — and the cluster id never changed. That is
+the whole subtest, satisfied.
+
+It failed anyway, on `10.128.253.16 sees 4 members ... want 3`, repeated for
+twenty minutes. `.16` is the replica that *was replaced*. Its last MEMBERS
+report was filed mid-handover, with `.22` already joined and itself not yet
+evicted — four members, correctly — and then it was gone. `LatestReports`
+returns the newest report per replica, so that one stands forever, and a check
+requiring every reporter to agree can never pass.
+
+This is the third appearance of one idea: **a self-report outlives the replica
+that wrote it.** Revision scoping fixed the first two, and cannot fix this one,
+because during a split the survivors and the replacement are legitimately on
+different revisions. The right filter is liveness, and muster already publishes
+it — Service Directory, withdrawn by the same `pre_stop` that evicts the member.
+
+Scoping to registered replicas also made the assertion stronger than the count
+it replaced. It now compares the reported member names against the registered
+addresses, so a group that swapped an evicted member for a stale one — exactly
+what `pre_stop` exists to prevent — fails instead of counting to three.
+
 ### Verified
 
 - `gofmt` clean; build + vet under every tag (default, `e2e`, `e2e_tikv`,

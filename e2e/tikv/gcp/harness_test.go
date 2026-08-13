@@ -326,3 +326,9 @@ func (s *stack) seedLease(ctx context.Context) (string, error) {
 	}
 	return strings.TrimSpace(out), nil
 }
+
+// memberName mirrors member_name() in pd.star: PD's member names are derived
+// from the address because a Cloud Run instance has no identity that outlives
+// it. Assertions that compare membership to the registered replicas have to
+// spell it the same way.
+func memberName(addr string) string { return "pd-" + strings.ReplaceAll(addr, ".", "-") }
