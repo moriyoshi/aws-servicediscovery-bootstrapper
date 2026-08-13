@@ -1,6 +1,6 @@
 # Journal
 
-## 2026-08-12 — Multi-cloud providers (AWS + Google Cloud)
+## 2026-08-12 – 13 — Multi-cloud providers (AWS + Google Cloud)
 
 Branch `feat/multicloud-providers` (PR #8), squashed to one commit off
 `0cac981`, plus the follow-ups merged since. Every commit leaves
@@ -578,7 +578,8 @@ The Google Cloud stack **has been applied**, repeatedly, against a real project.
 That settles the most important claim in this document, and most of the others.
 
 **A complete TiKV cluster now runs on Cloud Run worker pools, assembled by
-muster.** Read off the live stack rather than inferred:
+muster.** Seven of the eight subtests have passed in each of the last two runs;
+the table is read off the live stack rather than inferred:
 
 | Assertion | Live state |
 | --- | --- |
@@ -589,23 +590,37 @@ muster.** Read off the live stack rather than inferred:
 | `QuorumComplete` | each sees 3 members, not just itself |
 | `StoresUp` | 3 stores, `['Up', 'Up', 'Up']`, from each replica independently |
 | `SeedLease` | held by `10.128.253.18`, which is a registered replica |
-| `PDReplacementRejoins` | **failed** — see below; it asserted something Cloud Run cannot do |
+| `PDReplacementRejoins` | **failed three times, never for muster's reasons** — see below |
 
 Seed election is the part the whole provider exists for, and on Cloud Run it is
 no longer theoretical: from a cold start one replica took the lease and
 bootstrapped, two followed it, and every replica agrees on one cluster.
 
-Two of this session's fixes are confirmed in production by that table rather
-than by argument — the store tier is up, so the file-descriptor config works;
-and the numbers above were *read from the self-reports*, so the reporting loop
-survives its own failing first samples.
+Several fixes are confirmed in production by that table rather than by argument:
+the store tier is up, so the file-descriptor config works; the numbers were
+*read from the self-reports*, so the reporting loop survives its own failing
+first samples; and the last run's dump shows a replaced replica evicting itself
+from the Raft group inside Cloud Run's ten-second budget, which was the platform
+constraint most likely to be fatal.
 
-**Seven of the eight subtests now pass in one run.** The eighth, and the six
-failures that preceded it, were never the election — registry authentication, a
-configuration variable nothing read, the reporting loop's silent death, TiKV's
-file-descriptor demand, a readiness check reading the wrong API's field names,
-three stacked defects in the log reads, and finally an assertion that the
-platform cannot satisfy.
+**Nine distinct failures have cost a provision, and not one was the election.**
+In order: registry authentication; a configuration variable nothing read; the
+reporting loop's silent death; TiKV's file-descriptor demand; a readiness check
+reading the wrong API's field names; three stacked defects in the log reads; an
+assertion the platform cannot satisfy; a repository check that swallowed an
+expired credential and blamed a missing repository; and a stale self-report from
+a replica that had been replaced.
+
+Six of the nine were **silent** — an empty result, an unread variable, a
+discarded error, a log with nothing in it, a message with only one thing it
+could say. That is the finding this suite produced, more than any individual
+bug: on this platform the expensive failures are not the ones that shout.
+
+Three of the nine were in the *observation* of the cluster rather than the
+cluster, and all three were the same idea arriving in different clothes — **a
+self-report outlives the replica that wrote it.** Revision scoping answered the
+first two; the third needed liveness, because during a rolling replacement the
+survivors and the replacement are legitimately on different revisions.
 
 Still not verified, and needing infrastructure:
 
@@ -619,9 +634,13 @@ Still not verified, and needing infrastructure:
   single-process and cannot reproduce contention, retries, or the per-object
   write rate. The same gap applies to Firestore, where the emulator stands in
   for the server whose transaction semantics are the thing under test.
-- **`PDReplacementRejoins`** and the **Firestore backend against a real
-  database** (`KV_BACKEND=firestore`) are the two paths on Google Cloud that no
-  run has touched.
+- **`PDReplacementRejoins` has never completed.** Its three failures were an
+  assertion the platform cannot satisfy and then a stale-reporter artefact, and
+  the underlying behaviour looked correct in the logs each time — but "looked
+  correct in the logs" is not the same as a green run, and the fix for the last
+  one is itself unexercised.
+- The **Firestore backend against a real database** (`KV_BACKEND=firestore`) is
+  the other Google Cloud path no run has touched.
 
 ### Deferred
 
@@ -662,18 +681,24 @@ failure there means the provider work broke something rather than that new
 infrastructure code is wrong. It also now carries a change of its own: `me()`
 reads `SELF.ipv4` rather than `ifaddr()`, which has not been near Fargate.
 
-Then `e2e/tikv/gcp`, which now needs one clean pass rather than another repair:
-the cluster assembles, and every assertion but `PDReplacementRejoins` has been
-confirmed against a live stack by hand. That one is the next real unknown, and
-the ten-second shutdown budget is what should bite — if `pre_stop` cannot
-release the lease and evict the member inside it, the Raft group collects a dead
-member per replacement and the symptom is a slow loss of quorum rather than an
-obvious failure. `make logs-pd` and `make logs-tikv` are where it shows.
+Then `e2e/tikv/gcp`, which needs one clean pass rather than another repair. Seven
+subtests pass reliably; `PDReplacementRejoins` is the only one left, its last two
+failures were the harness rather than muster, and the ten-second shutdown budget
+— the thing most likely to defeat this platform — has now been observed working:
+a replaced replica evicted itself from the Raft group in under a second.
 
-The pattern across every failure so far is worth carrying forward: not one was
-in the election logic. All five were in the space between muster and the
-platform — a registry credential, a variable name, a background task nobody
-joined, a resource limit, and a field name. Four of the five were *silent*: they
-produced an empty value, an unread variable, a discarded error, a log with
-nothing in it. That space, and that failure mode, is where the remaining risk
-is.
+Two habits are worth carrying into whatever comes next, because they are what
+the nine failures actually taught:
+
+**Put the parsing where it can be tested.** Every one of the observation bugs
+lived in a build-tagged harness that needs a paid project to run, so nothing
+could catch them but a provision. Moving them to `e2e/internal/cloudrun` with
+captured API output as fixtures is what turned "read the docs again" into a test
+that fails on the desk. That package is where the next one should go too.
+
+**Make a check say what it does not know.** A readiness check that printed two
+empty fields, a filter that matched nothing, a repository check with one
+hypothesis — each cost a full provision, and each would have cost minutes if it
+had been able to say "this is not the shape I expected". Silence is the
+expensive failure mode here, which is also why muster now reports a task
+rejection nobody joined.
