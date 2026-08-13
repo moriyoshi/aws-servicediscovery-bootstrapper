@@ -16,24 +16,16 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"slices"
-	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/ecs"
-	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
-	servicediscovery_types "github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
-	"github.com/aws/smithy-go/middleware"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"go.starlark.net/starlark"
 	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/moriyoshi/muster/internal/provider"
+	_ "github.com/moriyoshi/muster/internal/providers"
 )
 
 var namespace string
@@ -47,9 +39,12 @@ var healthProbe bool
 
 // starlark engine
 var scriptPath string
-var kvTable string
+var providerName string
+var providerOpts = optFlags{}
+var providerHelpFlag bool
+var kvStoreName string
 var kvKeyPrefix string
-var kvCreateTable bool
+var kvCreate bool
 var allowRun bool
 
 func init() {
@@ -59,184 +54,18 @@ func init() {
 	flag.BoolVar(&healthProbe, "health-probe", false, "Run as a health-probe client against -control-socket and exit 0 (healthy) or non-zero; for use as a container HEALTHCHECK CMD")
 
 	flag.StringVar(&scriptPath, "script", "", "Path to the Starlark script that resolves the workload and defines lifecycle hooks (required)")
-	flag.StringVar(&kvTable, "kv-table", "", "DynamoDB table name backing the kv_* builtins (empty = kv disabled)")
-	flag.StringVar(&kvKeyPrefix, "kv-key-prefix", "", "Prefix applied to all kv_* keys, to namespace multiple clusters on one table")
-	flag.BoolVar(&kvCreateTable, "kv-create-table", false, "Create the kv table (on-demand billing, TTL on expires_at) if it does not exist")
+	flag.StringVar(&providerName, "provider", "", "Cloud provider to use (empty = $MUSTER_PROVIDER, then autodetect)")
+	flag.Var(providerOpts, "provider-opt", "Provider-specific option, k=v (repeatable); see -provider-help")
+	flag.BoolVar(&providerHelpFlag, "provider-help", false, "List the compiled-in providers and their -provider-opt keys, then exit")
+	flag.StringVar(&kvStoreName, "kv-store", "", "Name of the provider-side store backing the kv_* builtins -- a DynamoDB table on AWS (empty = kv disabled)")
+	flag.StringVar(&kvKeyPrefix, "kv-key-prefix", "", "Prefix applied to all kv_* keys, to namespace multiple clusters on one store")
+	flag.BoolVar(&kvCreate, "kv-create", false, "Create the kv store with provider defaults if it does not exist")
 	flag.BoolVar(&allowRun, "allow-run", false, "Expose the run() builtin to scripts (arbitrary command execution)")
-}
 
-type entry struct {
-	IPv4Addr string
-	IPv6Addr string
-	Port     int
-}
-
-type serviceDiscovery struct {
-	svc       *servicediscovery.Client
-	namespace string                                    // default namespace
-	hsf       servicediscovery_types.HealthStatusFilter // default health-status filter
-}
-
-// discover performs a single CloudMap DiscoverInstances call and returns the
-// matching instances. An empty result is returned as an empty slice, not an
-// error — scripts retry with poll and decide how to handle emptiness.
-// namespace and healthStatus override the defaults when non-empty.
-func (sd *serviceDiscovery) discover(ctx context.Context, namespace, service, healthStatus string) ([]entry, error) {
-	if namespace == "" {
-		namespace = sd.namespace
+	// Registered only to report their replacement; see renamedFlags.
+	for old := range renamedFlags {
+		flag.String(old, "", "removed; see -"+renamedFlags[old])
 	}
-	hsf := sd.hsf
-	if healthStatus != "" {
-		hsf = servicediscovery_types.HealthStatusFilter(healthStatus)
-		if slices.Index(servicediscovery_types.HealthStatusFilterAll.Values(), hsf) < 0 {
-			return nil, fmt.Errorf("invalid health status: %s", healthStatus)
-		}
-	}
-	out, err := sd.svc.DiscoverInstances(ctx, &servicediscovery.DiscoverInstancesInput{
-		NamespaceName: aws.String(namespace),
-		ServiceName:   aws.String(service),
-		HealthStatus:  hsf,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to discover instances: %w", err)
-	}
-	entries := make([]entry, 0, len(out.Instances))
-	for _, instance := range out.Instances {
-		ipv4Addr, ipv6Addr, port := "", "", 0
-		if v, ok := instance.Attributes["AWS_INSTANCE_IPV4"]; ok {
-			ipv4Addr = v
-		}
-		if v, ok := instance.Attributes["AWS_INSTANCE_IPV6"]; ok {
-			ipv6Addr = v
-		}
-		if v, ok := instance.Attributes["AWS_INSTANCE_PORT"]; ok {
-			port, err = strconv.Atoi(v)
-			if err != nil {
-				return nil, fmt.Errorf("failed to convert port to int: %w", err)
-			}
-		}
-		entries = append(entries, entry{IPv4Addr: ipv4Addr, IPv6Addr: ipv6Addr, Port: port})
-	}
-	return entries, nil
-}
-
-type taskMetadataV4 struct {
-	Cluster          string `json:"Cluster"`
-	ServiceName      string `json:"ServiceName"`
-	VPCID            string `json:"VPCID"`
-	TaskARN          string `json:"TaskARN"`
-	Family           string `json:"Family"`
-	Revision         string `json:"Revision"`
-	AvailabilityZone string `json:"AvailabilityZone"`
-	CreatedAt        string `json:"CreatedAt"`
-}
-
-// metadataURIEnv lists, in preference order, the environment variables ECS uses
-// to advertise the task metadata endpoint. The name is ECS_-prefixed: the
-// AWS_CONTAINER_* variables are the credentials ones, and nothing ever sets
-// AWS_CONTAINER_METADATA_URI_V4 — reading it meant metadata was silently
-// unavailable on every ECS task, taking TASK and the no-argument form of
-// all_ecs_tasks_running() down with it.
-var metadataURIEnv = []string{
-	"ECS_CONTAINER_METADATA_URI_V4", // Fargate platform 1.4.0+, EC2 agent 1.39+
-	"ECS_CONTAINER_METADATA_URI",    // v3, for older agents
-}
-
-func metadataURI() string {
-	for _, name := range metadataURIEnv {
-		if uri := os.Getenv(name); uri != "" {
-			return uri
-		}
-	}
-	return ""
-}
-
-func fetchContainerMetadata(ctx context.Context) (*taskMetadataV4, error) {
-	uri := metadataURI()
-	if uri == "" {
-		return nil, fmt.Errorf("none of %s is set; not running under ECS?", strings.Join(metadataURIEnv, ", "))
-	}
-	req, err := http.NewRequest(http.MethodGet, uri+"/task", nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build a request: %w", err)
-	}
-	req = req.WithContext(ctx)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch container metadata: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch container metadata: %s", resp.Status)
-	}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-	metadata := new(taskMetadataV4)
-	err = json.Unmarshal(b, metadata)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal container metadata: %w", err)
-	}
-	// CreatedAt is a per-container field, exposed at the container root endpoint
-	// rather than /task. Fetch it best-effort so scripts can use it (e.g. as a
-	// deterministic tie-break for seed election).
-	if metadata.CreatedAt == "" {
-		if creq, cerr := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil); cerr == nil {
-			if cresp, cerr := http.DefaultClient.Do(creq); cerr == nil {
-				defer cresp.Body.Close()
-				if cb, cerr := io.ReadAll(cresp.Body); cerr == nil {
-					var container struct {
-						CreatedAt string `json:"CreatedAt"`
-					}
-					if json.Unmarshal(cb, &container) == nil {
-						metadata.CreatedAt = container.CreatedAt
-					}
-				}
-			}
-		}
-	}
-	return metadata, nil
-}
-
-// ecsDescriber is the subset of the ECS client used to check service stability;
-// it lets tests inject a fake.
-type ecsDescriber interface {
-	DescribeServices(ctx context.Context, in *ecs.DescribeServicesInput, opts ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error)
-}
-
-// ecsServiceStable reports whether the ECS service has RunningCount ==
-// DesiredCount (i.e. all its tasks are running). It backs the
-// all_ecs_tasks_running() builtin.
-func ecsServiceStable(ctx context.Context, client ecsDescriber, cluster, service string) (bool, error) {
-	out, err := client.DescribeServices(ctx, &ecs.DescribeServicesInput{
-		Cluster:  &cluster,
-		Services: []string{service},
-	})
-	if err != nil {
-		return false, fmt.Errorf("failed to describe ECS service: %w", err)
-	}
-	if len(out.Services) == 0 {
-		return false, fmt.Errorf("no ECS service found for %s", service)
-	}
-	return out.Services[0].RunningCount == out.Services[0].DesiredCount, nil
-}
-
-// disableEndpointPrefix applies the flag that will prevent any
-// operation-specific host prefix from being applied
-type disableEndpointPrefix struct{}
-
-func (disableEndpointPrefix) ID() string { return "disableEndpointPrefix" }
-
-func (disableEndpointPrefix) HandleInitialize(
-	ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler,
-) (middleware.InitializeOutput, middleware.Metadata, error) {
-	ctx = smithyhttp.SetHostnameImmutable(ctx, true)
-	return next.HandleInitialize(ctx, in)
-}
-
-func addDisableEndpointPrefix(stack *middleware.Stack) error {
-	return stack.Initialize.Add(disableEndpointPrefix{}, middleware.After)
 }
 
 // errRetriesExhausted is returned by superviseWorkload when the workload has
@@ -680,92 +509,99 @@ func runHealthProbe(ctx context.Context, path string) error {
 	return nil
 }
 
-func doIt(ctx context.Context, logger *slog.Logger) error {
-	if namespace == "" {
-		return fmt.Errorf("namespace is required")
+// openProvider selects the provider and resolves every capability from it. Each
+// capability keeps whatever error it failed with, so the builtin that needs one
+// can say why at the point of use rather than the harness refusing to start over
+// something the script may never touch.
+func openProvider(ctx context.Context, logger *slog.Logger) (provider.Provider, *engineDeps, error) {
+	factory, err := provider.Select(providerName)
+	if err != nil {
+		return nil, nil, err
 	}
-	// respawn/healthcheck settings come from the script's respawn()/healthcheck()
-	// calls; preconditions are folded into pre_start() via the ECS builtins. Both
-	// are validated / applied after the script loads.
-	// The trailing args after `--` are optional now; they are exposed to the
-	// script as the COMMAND global so a script can transform a base command.
-	cmdLine := flag.Args()
+	p, err := factory.Open(ctx, provider.Config{
+		Logger:    logger,
+		Namespace: namespace,
+		KVStore:   kvStoreName,
+		KVPrefix:  kvKeyPrefix,
+		Options:   providerOpts,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("provider %q: %w", factory.Name(), err)
+	}
 
+	// Identity first: the kv lease owner is derived from it, and Renew
+	// conditions on that owner, so a store built before identity resolved would
+	// hand out leases nobody can renew.
+	self, err := p.Self(ctx)
+	if err != nil {
+		// A provider that has no notion of identity is not a problem; a
+		// provider that has one and could not read it is, because the fallbacks
+		// it feeds (the lease owner, the replica-status target) get quietly
+		// worse. Only the second deserves a warning.
+		level := slog.LevelWarn
+		if errors.Is(err, provider.ErrUnsupported) {
+			level = slog.LevelDebug
+		}
+		logger.Log(ctx, level, "instance identity unavailable", slog.String("err", err.Error()))
+		self = nil
+	}
+
+	kv := capability(p.KV(ctx))
+	if kvCreate {
+		if err := provisionKV(ctx, p, kv); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	deps := &engineDeps{
+		logger:   logger,
+		disc:     capability(p.Discovery(ctx)),
+		kv:       kv,
+		fleet:    capability(p.Fleet(ctx)),
+		reg:      capability(p.Registrar(ctx)),
+		self:     self,
+		provider: p.Name(),
+		command:  flag.Args(),
+		allowRun: allowRun,
+		st:       newHarnessState(),
+		ifCache:  map[string]string{},
+	}
+	return p, deps, nil
+}
+
+// provisionKV honours -kv-create. Unlike the other capability failures this one
+// is fatal: the operator asked for the store to exist, so carrying on to fail
+// later inside a kv_* builtin would only obscure the reason.
+func provisionKV(ctx context.Context, p provider.Provider, kv optional[provider.KVStore]) error {
+	store, err := kv.require("kv store")
+	if err != nil {
+		return fmt.Errorf("-kv-create: %w", err)
+	}
+	prov, ok := store.(provider.Provisioner)
+	if !ok {
+		return fmt.Errorf("-kv-create: provider %q cannot create its kv store; provision it out of band", p.Name())
+	}
+	if err := prov.Provision(ctx); err != nil {
+		return fmt.Errorf("failed to ensure kv store: %w", err)
+	}
+	return nil
+}
+
+func doIt(ctx context.Context, logger *slog.Logger) error {
+	// respawn/healthcheck settings come from the script's spawn() arguments;
+	// preconditions are folded into pre_start() via the replica-status builtin.
+	// The trailing args after `--` are optional; they are exposed to the script
+	// as the COMMAND global so a script can transform a base command.
 	if scriptPath == "" {
 		return fmt.Errorf("-script is required")
 	}
 
-	cfg, err := config.LoadDefaultConfig(ctx)
+	prov, deps, err := openProvider(ctx, logger)
 	if err != nil {
 		return err
 	}
-	options := make([]func(*servicediscovery.Options), 0, 1)
-	if cfg.BaseEndpoint != nil {
-		options = append(options, servicediscovery.WithAPIOptions(addDisableEndpointPrefix))
-	}
-	svc := servicediscovery.NewFromConfig(
-		cfg,
-		options...,
-	)
-	{
-		loggerOpts := []any{
-			slog.String("aws_region", cfg.Region),
-			slog.String("namespace", namespace),
-		}
-		if cfg.BaseEndpoint != nil {
-			loggerOpts = append(loggerOpts, slog.String("aws_endpoint", *cfg.BaseEndpoint))
-		}
-		logger.Info(
-			"service discovery will be performed",
-			loggerOpts...,
-		)
-	}
-	sd := &serviceDiscovery{
-		svc:       svc,
-		namespace: namespace,
-		hsf:       servicediscovery_types.HealthStatusFilterHealthy,
-	}
-
-	// Task metadata is exposed to the script as the TASK global and used to
-	// derive the kv owner id. Best-effort: outside ECS it is simply absent.
-	meta, err := fetchContainerMetadata(ctx)
-	if err != nil {
-		logger.Warn("task metadata unavailable", slog.String("err", err.Error()))
-		meta = nil
-	}
-
-	// Optional DynamoDB-backed kv store for the kv_* builtins (seed election).
-	var kv kvStore
-	if kvTable != "" {
-		ddb := dynamodb.NewFromConfig(cfg)
-		owner := ""
-		if meta != nil && meta.TaskARN != "" {
-			owner = meta.TaskARN
-		} else if hn, herr := os.Hostname(); herr == nil {
-			owner = hn
-		}
-		dkv := newDynamoKV(ddb, kvTable, kvKeyPrefix, owner)
-		if kvCreateTable {
-			if err := dkv.ensureTable(ctx); err != nil {
-				return fmt.Errorf("failed to ensure kv table: %w", err)
-			}
-		}
-		kv = dkv
-		logger.Info("kv store enabled", slog.String("table", kvTable), slog.String("owner", owner))
-	}
-
-	st := newHarnessState()
-	deps := &engineDeps{
-		logger:   logger,
-		sd:       sd,
-		kv:       kv,
-		ecs:      ecs.NewFromConfig(cfg),
-		meta:     meta,
-		command:  cmdLine,
-		allowRun: allowRun,
-		st:       st,
-		ifCache:  map[string]string{},
-	}
+	defer prov.Close()
+	st := deps.st
 
 	gctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -825,6 +661,33 @@ const hardShutdownGrace = 60 * time.Second
 func main() {
 	flag.Parse()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	// Anything not passed on the command line can come from MUSTER_<FLAG>. See
+	// envflags.go for why a container entrypoint needs both channels.
+	if err := applyEnvDefaults(flag.CommandLine, os.LookupEnv); err != nil {
+		logger.Error("invalid configuration from the environment", slog.Any("err", err))
+		os.Exit(2)
+	}
+
+	if providerHelpFlag {
+		fmt.Print(providerHelp())
+		return
+	}
+	// Checked after parsing rather than left to flag itself: "flag provided but
+	// not defined" cannot name the replacement, and these two live in a task
+	// definition that can lag the image.
+	if err := checkRenamedFlags(func(name string) bool {
+		found := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == name {
+				found = true
+			}
+		})
+		return found
+	}); err != nil {
+		logger.Error("removed flag", slog.Any("err", err))
+		os.Exit(2)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

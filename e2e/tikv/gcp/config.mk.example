@@ -1,0 +1,23 @@
+# Copy to config.mk and adjust. Every value here has a working default except
+# the project.
+
+# Required, but falls back to `gcloud config get-value project`.
+# GCP_PROJECT=my-project
+
+# GCP_REGION=asia-northeast1
+
+# Prefix on every resource name, so two stacks can share a project.
+# NAME_PREFIX=muster-e2e-tikv-
+
+# TIKV_VERSION=v8.5.1
+
+# PD_COUNT must be odd for a Raft quorum; TIKV_COUNT at least 3, PD's default
+# max-replicas. Worker pool instances bill while they run, so these are the
+# cost knobs.
+# PD_COUNT=3
+# TIKV_COUNT=3
+
+# Which store backs the seed election: gcs (default) or firestore. firestore
+# additionally creates a named Firestore database, which is slower to stand up
+# and to tear down -- so it is opt-in rather than the default.
+# KV_BACKEND=gcs

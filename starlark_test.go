@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"go.starlark.net/starlark"
+
+	"github.com/moriyoshi/muster/internal/provider"
+	"github.com/moriyoshi/muster/internal/provider/memkv"
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -205,12 +208,12 @@ func TestPromiseCapabilityErrors(t *testing.T) {
 }
 
 func TestPoll(t *testing.T) {
-	kv := newMemKV("o")
+	kv := memkv.New("o")
 	kv.PutIfAbsent(context.Background(), "up", "1", 0)
 	v := joinValue(t, mustMain(t, `
 def main():
     return poll(lambda: kv_get("up") != None, "5s", interval="10ms")
-`, &engineDeps{kv: kv}))
+`, &engineDeps{kv: resolved[provider.KVStore](kv)}))
 	if v != starlark.True {
 		t.Fatalf("poll should resolve True, got %v", v)
 	}
@@ -290,12 +293,12 @@ def main():
 }
 
 func TestKVBuiltins(t *testing.T) {
-	kv := newMemKV("o")
+	kv := memkv.New("o")
 	v := joinValue(t, mustMain(t, `
 def main():
     kv_put_if_absent("k", "v", 0)
     return go(lambda: kv_get("k"))
-`, &engineDeps{kv: kv}))
+`, &engineDeps{kv: resolved[provider.KVStore](kv)}))
 	if s, _ := starlark.AsString(v); s != "v" {
 		t.Fatalf("want v, got %v", v)
 	}
@@ -317,7 +320,7 @@ func TestRunBuiltinGating(t *testing.T) {
 // shared kv store; exactly one wins "bootstrap".
 func TestSeedElection(t *testing.T) {
 	const n = 12
-	shared := newMemKV("shared")
+	shared := memkv.New("shared")
 	src := `
 def main():
     role = "bootstrap" if kv_put_if_absent("cluster/seed", "me", 60) else "join"
@@ -325,7 +328,7 @@ def main():
 `
 	engines := make([]*engine, n)
 	for i := range engines {
-		engines[i] = testEngine(t, src, &engineDeps{kv: shared})
+		engines[i] = testEngine(t, src, &engineDeps{kv: resolved[provider.KVStore](shared)})
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -358,5 +361,30 @@ def main():
 	}
 	if boots != 1 {
 		t.Fatalf("expected exactly one bootstrap, got %d (%v)", boots, results)
+	}
+}
+
+// SELF and PROVIDER are the script's window onto the platform. PROVIDER is set
+// even when identity did not resolve, because that is exactly when a script has
+// to branch on the platform.
+func TestSelfAndProviderGlobals(t *testing.T) {
+	src := `def main(): return go(lambda: "%s/%s/%s" % (PROVIDER, SELF.id, SELF.aws.family))`
+	v := joinValue(t, mustMain(t, src, &engineDeps{
+		provider: "aws",
+		self: &provider.Identity{
+			Provider: "aws",
+			ID:       "arn:aws:ecs:ap-northeast-1:1:task/c/abc",
+			Extra:    map[string]string{"family": "fam"},
+		},
+	}))
+	if s, _ := starlark.AsString(v); s != "aws/arn:aws:ecs:ap-northeast-1:1:task/c/abc/fam" {
+		t.Fatalf("got %q", s)
+	}
+
+	v = joinValue(t, mustMain(t,
+		`def main(): return go(lambda: "%s/%s" % (PROVIDER, "none" if SELF == None else "some"))`,
+		&engineDeps{provider: "mem"}))
+	if s, _ := starlark.AsString(v); s != "mem/none" {
+		t.Fatalf("PROVIDER must survive identity being absent, got %q", s)
 	}
 }
