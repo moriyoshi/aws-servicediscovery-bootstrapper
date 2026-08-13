@@ -311,13 +311,32 @@ def pd_pre_stop():
     stable identities would want.
     """
     ip = me()
+
+    # Each fallible step on its own task, awaited with select(), which does not
+    # re-raise. http_request raises when a peer is already gone -- and during a
+    # teardown that stops several instances at once, it will be -- so a bare
+    # call here aborts pre_stop and skips everything after it.
+    #
+    # What that cost: a failed DELETE meant deregister() never ran, and the
+    # instance left its Service Directory endpoint behind. The cluster was fine
+    # and discovery was not, which is the worse of the two failures, because
+    # every peer that later reads discovery believes in a replica that is gone.
+    select(go(release_seed, ip))
+    select(go(evict_member, ip))
+
+    # Last, and deliberately bare: by this point nothing depends on it, so a
+    # failure should be reported as a failed pre_stop rather than swallowed.
+    deregister()
+
+
+def release_seed(ip):
     kv_delete(SEED_KEY, if_value = ip)
 
+
+def evict_member(ip):
     name = member_name(ip)
     if not drop_member(live_peers(other_pds(ip)), name):
         log("pd: no peer accepted the member removal", name = name)
-
-    deregister()
 
 
 def main():

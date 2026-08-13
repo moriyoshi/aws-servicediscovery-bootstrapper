@@ -134,7 +134,7 @@ func (e *engine) spawnFunc(ctx context.Context, name string, run func(context.Co
 				return
 			}
 			p.reject(err)
-			e.reportIfUnobserved(p, err)
+			e.reportIfUnobserved(ctx, p, err)
 			return
 		}
 		p.resolve(v)
@@ -158,7 +158,7 @@ func (e *engine) spawnFunc(ctx context.Context, name string, run func(context.Co
 //
 // A joined promise reports through its joiner, so staying quiet in that case is
 // what keeps this from double-reporting every ordinary error.
-func (e *engine) reportIfUnobserved(p *promise, err error) {
+func (e *engine) reportIfUnobserved(ctx context.Context, p *promise, err error) {
 	grace := e.unobservedGrace
 	if grace <= 0 {
 		grace = defaultUnobservedGrace
@@ -168,6 +168,14 @@ func (e *engine) reportIfUnobserved(p *promise, err error) {
 		defer timer.Stop()
 		<-timer.C
 		if p.awaited.Load() {
+			return
+		}
+		// A task that was still running when the process began shutting down did
+		// not fail; it was stopped. Reporting those would put a lost-failure
+		// warning in the logs of every clean shutdown that had a background loop
+		// running -- which is every one, since a background loop is the reason
+		// this exists.
+		if ctx.Err() != nil {
 			return
 		}
 		e.deps.logger.Warn("task failed and nothing joined it; its error would "+

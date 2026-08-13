@@ -86,22 +86,31 @@ what the ECS suite achieves by shelling into each task.
 | `QuorumComplete` | Every replica sees the full membership — not just one of them. A member that formed its own view is a split brain one level down. |
 | `StoresUp` | PD knows exactly the expected stores, all `Up`. |
 | `SeedLease` | The lease is released, or held by a registered replica. |
-| `PDReplacementRejoins` | Replaces **one** PD instance and requires the cluster id — and the membership count — to survive. Skipped under `go test -short`. |
+| `PDReplacementRejoins` | Scales the PD pool to 2 and back to 3, requiring the departing member to be evicted and the replacement to rejoin **the same cluster**. Skipped under `go test -short`. |
 
-`PDReplacementRejoins` replaces one instance of three, which is the same claim
-the ECS version makes by stopping one task — and it took a failed run to arrive
-at. Rolling the revision outright, which is what it did first, asserts something
-Cloud Run cannot do: a revision update replaces *every* instance of a worker
-pool, and with three ephemeral disks discarded together nothing is left to carry
-the cluster. The seed lease carries an address, not cluster state, and PD cannot
-be told to adopt an id, so a fresh tier correctly bootstraps a fresh cluster.
+`PDReplacementRejoins` makes the same claim the ECS version does by stopping one
+task, and it took **two** failed runs to find a way to say it here.
 
-Hence `--no-promote` followed by `update-instance-split --to-revisions=<new>=34`:
-the new revision takes one instance of three, two members survive, quorum holds,
-and the replacement has something to join. A mismatched cluster id fails
-immediately rather than waiting out the timeout — that is the one failure this
-subtest exists to catch, and the first version reported it as "2 of 3 replicas
-have reported".
+Rolling the revision, the first attempt, asserts something Cloud Run cannot do:
+a revision update replaces *every* instance of a worker pool, and with three
+ephemeral disks discarded together nothing is left to carry the cluster. The
+seed lease carries an address, not cluster state, and PD cannot be told to adopt
+an id, so a fresh tier correctly bootstraps a fresh cluster.
+
+Deploying unpromoted and moving a third of the instances onto the new revision
+(`--no-promote`, then `update-instance-split --to-revisions=<new>=34`) does not
+replace one either. Under `MANUAL` scaling the instance count is honoured *per
+revision*, so the pool ran the old revision's three alongside the new one's one
+and four replicas registered themselves — for twenty minutes, until the test
+gave up.
+
+What works is the instance count, which lives on the pool rather than the
+revision template and therefore scales in place: **3 → 2 → 3**. Going down, an
+instance stops and its `pre_stop` must evict its member inside the ten-second
+budget. Coming back up, a new instance appears at a new address with an empty
+disk and must join rather than bootstrap. Both halves assert that the membership
+is exactly the replicas currently registered in Service Directory, by name, and
+a mismatched cluster id fails immediately instead of waiting out the timeout.
 
 ## Running it
 

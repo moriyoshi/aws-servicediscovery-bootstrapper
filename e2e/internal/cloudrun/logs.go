@@ -84,6 +84,19 @@ func ParseEntries(raw []byte) ([]LogEntry, error) {
 // RevisionLabel is where an entry records the revision whose instance wrote it.
 const RevisionLabel = "revision_name"
 
+// StructuredFilter selects the entries muster wrote: it logs JSON on stdout,
+// which the agent parses into jsonPayload, while the workload's own output
+// arrives as textPayload.
+const StructuredFilter = `jsonPayload.msg!=""`
+
+// MsgFilter selects one kind of line by its exact message. Cloud Logging's
+// --limit bounds what the query returns, not what matches afterwards, so a
+// caller after a handful of self-reports has to say so in the filter or spend
+// the whole limit on whatever the workload happened to be printing.
+func MsgFilter(msg string) string {
+	return fmt.Sprintf("jsonPayload.msg=%q", msg)
+}
+
 // IsReport reports whether an entry is one of the periodic self-reports. They
 // are the assertions' input and a failure dump's noise: each carries a whole PD
 // API response, so a handful of them crowds out everything else.

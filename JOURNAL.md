@@ -557,6 +557,47 @@ it replaced. It now compares the reported member names against the registered
 addresses, so a group that swapped an evicted member for a stale one — exactly
 what `pre_stop` exists to prevent — fails instead of counting to three.
 
+### Replacing one instance, third attempt — and two real bugs behind it
+
+The instance split does not replace an instance. Under `MANUAL` scaling the
+count is honoured **per revision**, so `--no-promote` plus
+`update-instance-split --to-revisions=<new>=34` left the pool running the old
+revision's three *and* the new one's one: four replicas registered, for twenty
+minutes. The first attempt (roll the revision) asserted something the platform
+cannot do; the second asserted something the platform does differently than
+documented. Both were wrong about the same thing — what a Cloud Run worker pool
+does when you ask it to change.
+
+The instance count is on the pool, not the revision template, so it scales in
+place and rolls nothing: **3 → 2 → 3**. Down, an instance stops and `pre_stop`
+must evict its member; up, a new instance joins at a new address with an empty
+disk. That is the ECS claim, and now both halves are asserted.
+
+Two genuine bugs surfaced on the way, neither of which the test was looking for.
+
+**`pd_pre_stop` skipped `deregister()` when a peer was already gone.**
+`http_request` raises on a transport error, Starlark cannot catch it, so a
+failed member DELETE aborted the rest of `pre_stop` — including the
+deregistration. The instance left its Service Directory endpoint behind: the
+cluster was fine and *discovery* was not, which is the worse of the two, because
+every peer that later reads discovery believes in a replica that is gone. Same
+containment as the reporting loop: each fallible step on its own task, awaited
+with `select()`. This is the third place in one script where the fix is "a raise
+must not escape", which is worth stating as a rule — **in Starlark, containment
+is structural or it does not exist.**
+
+**muster reported a lost task failure on every clean shutdown.** The
+unobserved-rejection warning added earlier fired for background loops cancelled
+during teardown, which had not failed at all — they were stopped. It now stays
+quiet when the parent context is already done. A diagnostic that cries wolf at
+every shutdown would have been unlearned within a week.
+
+And the failure dump was empty again, for a new reason: `--limit` bounds what the
+query *returns*, not what matches, and four thousand entries from the PD pool
+cover about fifteen seconds. Filtering muster's lines out of that in Go means the
+lines worth having were never fetched. The filter is now server-side, so the
+limit is spent on the lines being asked for.
+
 ### Verified
 
 - `gofmt` clean; build + vet under every tag (default, `e2e`, `e2e_tikv`,

@@ -175,11 +175,19 @@ func (s *stack) describePool(ctx context.Context, pool string) ([]byte, error) {
 // tested here.
 // An empty revision reads every revision's entries, which is what a failure dump
 // wants and what an assertion must not have.
-func (s *stack) logEntries(ctx context.Context, pool, revision string, freshness time.Duration, limit int) ([]cloudrun.LogEntry, error) {
+func (s *stack) logEntries(ctx context.Context, pool, revision, extra string, freshness time.Duration, limit int) ([]cloudrun.LogEntry, error) {
 	filter := fmt.Sprintf(`resource.type=%q AND resource.labels.worker_pool_name=%q`,
 		cloudrun.WorkerPoolResourceType, pool)
 	if revision != "" {
 		filter += fmt.Sprintf(" AND resource.labels.%s=%q", cloudrun.RevisionLabel, revision)
+	}
+	// Narrowing here rather than in Go, because --limit applies to what the
+	// query returns and PD drowns everything else: four thousand entries from
+	// this pool cover about fifteen seconds. Filtering afterwards means the
+	// lines worth having were never fetched -- a dump of muster's decisions
+	// came back with none of them at all, which is how this was found.
+	if extra != "" {
+		filter += " AND " + extra
 	}
 	out, err := s.gcloud(ctx, "logging", "read", filter,
 		// Newest first, and the limit is the reason. PD is loud -- thousands of
@@ -205,6 +213,18 @@ func (s *stack) logEntries(ctx context.Context, pool, revision string, freshness
 // longer exist -- and those reported a different cluster id, which is precisely
 // what NoSplitBrain is looking for. Read without the scope, a healthy pool
 // reports five replicas and two clusters.
+// latestReportsSince reads within a window instead of the current revision.
+// Scaling does not roll the pool, so a revision scope would be right here too --
+// but the window is what makes a report from before the change unusable, which
+// is the property the replacement assertions actually need.
+func (s *stack) latestReportsSince(ctx context.Context, pool, msg string, window time.Duration) (map[string]cloudrun.Report, error) {
+	entries, err := s.logEntries(ctx, pool, "", cloudrun.MsgFilter(msg), window, 500)
+	if err != nil {
+		return nil, err
+	}
+	return cloudrun.LatestReports(entries, msg), nil
+}
+
 func (s *stack) latestReports(ctx context.Context, pool, msg string) (map[string]cloudrun.Report, error) {
 	raw, err := s.describePool(ctx, pool)
 	if err != nil {
@@ -214,7 +234,7 @@ func (s *stack) latestReports(ctx context.Context, pool, msg string) (map[string
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", pool, err)
 	}
-	entries, err := s.logEntries(ctx, pool, revision, 60*time.Minute, 4000)
+	entries, err := s.logEntries(ctx, pool, revision, cloudrun.MsgFilter(msg), 60*time.Minute, 500)
 	if err != nil {
 		return nil, err
 	}
@@ -230,25 +250,35 @@ func (s *stack) latestReports(ctx context.Context, pool, msg string) (map[string
 // which branch a replica took.
 func (s *stack) dumpLogs(t *testing.T, pool string, limit int) {
 	t.Helper()
-	// Deliberately unscoped: after a failure you want every generation, not the
-	// one that happens to be current.
-	entries, err := s.logEntries(context.Background(), pool, "", 60*time.Minute, 4000)
+	// Two queries, because one cannot serve both halves: muster's lines have to
+	// be selected by the server or the workload's volume buries them, and the
+	// workload's tail has to be unfiltered to be a tail. Both deliberately
+	// unscoped by revision -- after a failure you want every generation, not
+	// whichever is current.
+	byTime := func(e []cloudrun.LogEntry) {
+		sort.Slice(e, func(i, j int) bool { return e[i].Timestamp < e[j].Timestamp })
+	}
+
+	decisions, err := s.logEntries(context.Background(), pool, "", cloudrun.StructuredFilter,
+		6*time.Hour, 1000)
+	if err != nil {
+		t.Logf("could not read %s's muster lines: %v", pool, err)
+	} else {
+		byTime(decisions)
+		decisions = cloudrun.Decisions(decisions)
+		t.Logf("--- %s: what muster decided (%d lines) ---", pool, len(decisions))
+		for _, e := range decisions {
+			t.Logf("  | %s", e)
+		}
+	}
+
+	entries, err := s.logEntries(context.Background(), pool, "", "", 60*time.Minute, limit)
 	if err != nil {
 		t.Logf("could not read logs for %s: %v", pool, err)
 		return
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Timestamp < entries[j].Timestamp })
-
-	decisions := cloudrun.Decisions(entries)
-	t.Logf("--- %s: what muster decided (%d lines) ---", pool, len(decisions))
-	for _, e := range decisions {
-		t.Logf("  | %s", e)
-	}
-
+	byTime(entries)
 	workload := cloudrun.Workload(entries)
-	if len(workload) > limit {
-		workload = workload[len(workload)-limit:]
-	}
 	t.Logf("--- %s: last %d lines from the workload ---", pool, len(workload))
 	for _, e := range workload {
 		t.Logf("  | %s", e)
