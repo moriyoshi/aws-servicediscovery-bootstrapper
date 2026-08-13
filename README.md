@@ -94,14 +94,19 @@ expose per-instance counts, and the only source is a Cloud Monitoring metric
 delayed by minutes. The portable substitute is to count what you can see —
 `len(instances(svc, health_status="ALL")) >= n`.
 
-Selection is `-provider`, then `$MUSTER_PROVIDER`, then autodetection.
-**Autodetection covers AWS only**: it keys off the ECS task metadata variables,
-and a managed instance group is an ordinary Compute Engine VM with nothing in
-its environment to key off. Detection deliberately never dials the metadata
-server, because that would cost a timeout on every container start on every
-other platform. A GCP deployment therefore has to say so — set
-`MUSTER_PROVIDER=gcp` in the instance template alongside the rest of its
-metadata.
+Selection is `-provider`, then `$MUSTER_PROVIDER`, then autodetection —
+which covers **both** clouds, because both runtimes announce themselves in the
+environment: ECS sets `ECS_CONTAINER_METADATA_URI_V4`, and Cloud Run sets
+`K_SERVICE`, `CLOUD_RUN_JOB` or `CLOUD_RUN_WORKER_POOL` according to which of
+the three you deployed. The Google Cloud end-to-end stack sets no
+`MUSTER_PROVIDER` at all, so that this keeps working is one of the things it
+tests.
+
+Detection is environment-only and deliberately never dials the metadata server,
+which would cost a timeout on every container start on every other platform.
+That rules out autodetecting a runtime with nothing distinguishing in its
+environment — a bare Compute Engine VM, for one — and such a deployment has to
+name its provider explicitly.
 
 A third provider, `mem`, is always compiled in and has to be asked for by name.
 It backs `kv_*` with an in-process store and supports nothing else, so
@@ -136,7 +141,11 @@ revision's service account with nothing to configure. Everything else is a
 - `location=<region>` — the Service Directory location. Defaults to this instance's own region.
 - `kv.backend=gcs|firestore` — which store backs `kv_*`. Default `gcs`. See [below](#backing-store-google-cloud).
 - `kv.database=<id>` — the Firestore database. Default `(default)`; ignored by the `gcs` backend.
-- `endpoint.storage=`, `endpoint.servicedirectory=`, `endpoint.compute=` — endpoint overrides for a fake server. Setting one also disables authentication for that client, since a fake has no credentials to detect and looking for them would hang.
+- `endpoint.storage=`, `endpoint.servicedirectory=` — endpoint overrides for a fake server. Setting one also disables authentication for that client, since a fake has no credentials to detect and looking for them would hang. The Firestore backend has no equivalent option: its client reads `FIRESTORE_EMULATOR_HOST` itself.
+
+An unknown key is a startup error rather than a shrug, so `-provider-help` is the
+list that matters — the one above is these two plus `project`, `location`,
+`kv.backend` and `kv.database`, and nothing else.
 
 **IAM**, granted on the resource rather than the project:
 
@@ -144,22 +153,23 @@ revision's service account with nothing to configure. Everything else is a
 | --- | --- |
 | `instances()` | `roles/servicedirectory.viewer` on the namespace |
 | `register()` / `deregister()` | `roles/servicedirectory.editor` on the namespace |
-| `kv_*` | `roles/storage.objectUser` on the bucket |
-| `-kv-create` | `storage.buckets.create`; see [below](#backing-store-google-cloud) |
+| `kv_*` (`kv.backend=gcs`) | `roles/storage.objectUser` on the bucket |
+| `kv_*` (`kv.backend=firestore`) | `roles/datastore.user`, necessarily project-wide — Firestore has no per-database IAM |
+| `-kv-create` | `storage.buckets.create`; the `gcs` backend only, see [below](#backing-store-google-cloud) |
 
 **Nothing registers a Cloud Run instance for you.** Service Directory
 auto-registration covers GKE Services, and Cloud Run has no equivalent of ECS
 Service Connect, so a clustered workload on a worker pool has to announce
 itself: `register(service, port=…)` from `post_start`, `deregister()` from
-`pre_stop` while peers are still reachable. Registration is keyed on the
-instance id, which does *not* survive replacement — so unlike a platform with
-stable names, a restarted instance does not reclaim its own entry, and one
-killed without teardown leaves a stale endpoint behind. Probe discovered peers
-before trusting them, which is the portable habit anyway.
+`pre_stop` while peers are still reachable.
 
-Autodetection covers Cloud Run: it sets `K_SERVICE` on a service,
-`CLOUD_RUN_JOB` on a job and `CLOUD_RUN_WORKER_POOL` on a worker pool, so
-`-provider` and `MUSTER_PROVIDER` are optional there.
+Endpoints are keyed on the **address**, not the instance id: a Service Directory
+endpoint id is at most 63 characters of `[a-z0-9-]` and a Cloud Run instance id
+is some two hundred hex digits, so the obvious key does not fit. Keying on the
+address means a replacement that lands on the same one inherits the entry rather
+than adding a second — but an instance killed without teardown still leaves a
+stale endpoint behind, because nothing else will withdraw it. Probe discovered
+peers before trusting them, which is the portable habit anyway.
 
 ## Usage
 
@@ -313,9 +323,15 @@ A task that **rejects with nothing to join it** is logged: `join()`, `select()`
 and `any_true()` all count as observing the outcome, and a failure none of them
 ever collects would otherwise be discarded in silence. This is what makes a
 background `go()` loop safe to start — a loop that dies on its first iteration
-says so, instead of looking exactly like a loop with nothing to report. Since
-Starlark cannot catch a raise, containing a failure means running the fallible
-part on its own task and awaiting it with `select()`, which does not re-raise.
+says so, instead of looking exactly like a loop with nothing to report. A task
+still running when muster begins shutting down is not reported: it was stopped,
+not failed.
+
+Since Starlark cannot catch a raise, **containing a failure is structural**: run
+the fallible part on its own task and await it with `select()`, which unlike
+`join()` does not re-raise. That is the only way to express "skip this and carry
+on", and it is what a `pre_stop` doing several independent things needs — a peer
+that has already gone must not cost you the deregistration after it.
 
 Every promise has `p.done()`. **Cancellable** promises (`go`/`poll`) add `p.cancel()` (abort and discard → resolves `None`). **Signallable** promises (`spawn()`, bare `promise()`) add `p.signal(value)` / `p.reject(err)`. `go`/`poll` accept `signallable=True`; `promise()` accepts `cancellable=`/`signallable=`.
 
@@ -323,7 +339,7 @@ Every promise has `p.done()`. **Cancellable** promises (`go`/`poll`) add `p.canc
 
 - `COMMAND`: the trailing `--` command as a list of strings.
 - `PROVIDER`: the compiled-in provider's name (`"aws"` / `"gcp"` / `"mem"`). Always set, including when `SELF` is `None` — which is exactly when a script needs it.
-- `SELF`: this instance's identity — `.id` (unique, stable for its lifetime; also the kv lease owner), `.name` (stable across replacement, **empty on ECS**, which has no such thing — derive a member name from `.ipv4` there instead), `.group`, `.service`, `.zone`, `.region`, `.network`, `.ipv4`, `.ipv6`, `.created_at`, plus a sub-struct named for the provider — `SELF.aws` carrying `.task_arn`, `.cluster`, `.family`, `.revision`, `.vpc_id`; `SELF.gcp` carrying `.project`, `.instance_id`, `.mig`, `.mig_location`. Reading the wrong one raises, so anything under that name is a visible declaration that the script is not portable. `None` when the platform gave muster nothing, so `if SELF:` is a real guard. Read once at startup. Individual fields can be empty even on a supported platform — notably `.network` on Fargate, which AWS only populates for tasks on EC2 container instances, and `.created_at` on GCE, which the metadata server does not carry.
+- `SELF`: this instance's identity — `.id` (unique, stable for its lifetime; also the kv lease owner), `.name` (stable across replacement, **empty on ECS**, which has no such thing — derive a member name from `.ipv4` there instead), `.group`, `.service`, `.zone`, `.region`, `.network`, `.ipv4`, `.ipv6`, `.created_at`, plus a sub-struct named for the provider — `SELF.aws` carrying `.task_arn`, `.cluster`, `.family`, `.revision`, `.vpc_id`; `SELF.gcp` carrying `.project`, `.instance_id`, and whichever of `.service`, `.revision`, `.configuration`, `.job`, `.execution` and `.task_index` the runtime sets. Reading the wrong one raises, so anything under that name is a visible declaration that the script is not portable. `None` when the platform gave muster nothing, so `if SELF:` is a real guard. Read once at startup. Individual fields can be empty even on a supported platform — notably `.network` on Fargate, which AWS only populates for tasks on EC2 container instances, and `.created_at` on Cloud Run, which the metadata server does not carry.
 
 ### Builtins
 
@@ -604,6 +620,13 @@ that stack is reachable from outside the VPC and there is no bastion, so each PD
 replica reports its own view on a loop and the test reads those back: asking
 *every* replica about *itself* is what makes the split-brain check exhaustive,
 the same property the ECS suite gets from shelling into each task.
+
+It makes the replacement claim too, by scaling the PD pool to two and back to
+three: an instance stops, and its `pre_stop` has to evict its member from the
+Raft group inside Cloud Run's **fixed ten-second** shutdown budget — the one
+platform difference that could have made a clustered workload impossible here —
+then the replacement has to join the same cluster rather than bootstrap a new
+one. Both halves pass.
 
 ```bash
 cd e2e/tikv/gcp && make e2e
