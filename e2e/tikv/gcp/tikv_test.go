@@ -5,6 +5,7 @@ package gcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -207,6 +208,108 @@ func TestTiKVOnCloudRun(t *testing.T) {
 			}
 		}
 		t.Errorf("seed lease %q belongs to no registered PD replica", lease)
+	})
+
+	// Replacing a *store* is the harder half, and the one that bit for real.
+	//
+	// A store's identity lives in its data directory, which here is an ephemeral
+	// volume. So the replacement is not the same store returning: it is a new,
+	// empty one at a new address, while PD keeps the old record and every region
+	// that had a replica on it. PD recovers on its own only after
+	// max-store-down-time -- thirty minutes by default -- which is long enough
+	// for a rolling change to replace the next store, and the one after that,
+	// until no region has a live replica left. That state is unrecoverable and
+	// it arrives with every instance running and every health check green.
+	//
+	// pd.star releases the dead record itself. This asserts that it does.
+	//
+	// Scaled rather than rolled, for the reason PDReplacementRejoins gives at
+	// length: the instance count lives on the pool, so changing it replaces one
+	// instance in place instead of every instance at once.
+	t.Run("StoreReplacementIsReaped", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("-short: skipping the store replacement cycle")
+		}
+
+		scaleStores := func(n int) {
+			t.Helper()
+			if err := harness.Run(t, "gcloud", "beta", "run", "worker-pools", "update", s.tikvPool,
+				"--project="+s.project, "--region="+s.region,
+				"--instances="+fmt.Sprint(n), "--quiet"); err != nil {
+				t.Fatalf("scale the TiKV pool to %d: %v", n, err)
+			}
+		}
+
+		// storesConverged waits for every PD replica's view of the store tier to
+		// be exactly the stores that are registered right now, all Up.
+		//
+		// Scoped to reports written since `since`, because a self-report outlives
+		// the replica that wrote it: a departing instance files one last report
+		// and is then gone, and that report never updates.
+		storesConverged := func(what string, since time.Duration, want int) {
+			t.Helper()
+			harness.Eventually(t, what, 20*time.Minute, 20*time.Second,
+				func(ctx context.Context) error {
+					eps, err := s.endpoints(ctx, s.tikvService)
+					if err != nil {
+						return err
+					}
+					live := map[string]bool{}
+					for _, e := range eps {
+						live[e.Address+":20160"] = true
+					}
+					if len(live) != want {
+						return fmt.Errorf("%d TiKV endpoints registered, want %d", len(live), want)
+					}
+
+					reports, err := s.latestReportsSince(ctx, s.pdPool, "pd: STORES", since)
+					if err != nil {
+						return err
+					}
+					if len(reports) == 0 {
+						return errors.New("no store report in the window yet")
+					}
+					for who, r := range reports {
+						var stores pdStores
+						if err := json.Unmarshal([]byte(r.Body), &stores); err != nil {
+							return fmt.Errorf("%s: decode: %w", who, err)
+						}
+						known := 0
+						for _, entry := range stores.Stores {
+							// A tombstone is the end state of a successful
+							// release, not a leftover.
+							if entry.Store.StateName == "Tombstone" {
+								continue
+							}
+							if entry.Store.StateName != "Up" {
+								return fmt.Errorf("%s: store %d (%s) is %s",
+									who, entry.Store.ID, entry.Store.Address, entry.Store.StateName)
+							}
+							if !live[entry.Store.Address] {
+								return fmt.Errorf("%s: PD still lists store %s, which is not registered",
+									who, entry.Store.Address)
+							}
+							known++
+						}
+						if known != want {
+							return fmt.Errorf("%s: PD knows %d live stores, want %d", who, known, want)
+						}
+					}
+					return nil
+				})
+		}
+
+		before := time.Now()
+		scaleStores(s.tikvWant - 1)
+		// One store gone, and with it that store's replicas. The record has to
+		// be released before the window below expires -- far shorter than
+		// max-store-down-time, so if this passes something released it early,
+		// and the only thing that does is pd.star.
+		storesConverged("PD's store list back to the stores that exist", time.Since(before), s.tikvWant-1)
+
+		before = time.Now()
+		scaleStores(s.tikvWant)
+		storesConverged("replacement store accepted into the cluster", time.Since(before), s.tikvWant)
 	})
 
 	t.Run("PDReplacementRejoins", func(t *testing.T) {

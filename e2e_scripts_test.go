@@ -63,24 +63,32 @@ func TestE2EScriptsLoad(t *testing.T) {
 		funcs []string
 	}{
 		{
-			path:  "e2e/tikv/aws/docker/tikv-pd/pd.star",
-			funcs: []string{"resolve_pd", "pd_pre_stop", "pd_readiness", "pd_liveness", "lineup", "drop_member"},
+			path: "e2e/tikv/aws/docker/tikv-pd/pd.star",
+			funcs: []string{
+				"resolve_pd", "pd_pre_stop", "pd_readiness", "pd_liveness", "lineup", "drop_member",
+				"seed_looks_abandoned", "discovery_is_trustworthy", "stale_store", "prune_pass", "prune_loop",
+			},
 		},
 		{
-			path:  "e2e/tikv/aws/docker/tikv-node/tikv.star",
-			funcs: []string{"resolve_tikv", "tikv_readiness", "tikv_liveness"},
+			path: "e2e/tikv/aws/docker/tikv-node/tikv.star",
+			funcs: []string{
+				"resolve_tikv", "tikv_readiness", "tikv_liveness",
+				"pd_stores", "store_state",
+			},
 		},
 		{
 			path: "e2e/tikv/gcp/docker/tikv-pd/pd.star",
 			funcs: []string{
 				"resolve_pd", "pd_pre_stop", "pd_readiness", "pd_liveness",
 				"lineup", "drop_member", "member_name", "pd_registered", "report",
+				"seed_looks_abandoned", "discovery_is_trustworthy", "stale_store", "prune_pass", "prune_loop",
 			},
 		},
 		{
 			path: "e2e/tikv/gcp/docker/tikv-node/tikv.star",
 			funcs: []string{
 				"resolve_tikv", "tikv_readiness", "tikv_liveness", "tikv_registered",
+				"pd_stores", "store_state",
 			},
 		},
 	} {
@@ -341,5 +349,248 @@ func TestE2ETiKVAWSMeFailsWithNoAddressSource(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "MUSTER_SUBNET_CIDR") {
 		t.Errorf("me() failed without naming the missing configuration: %v", err)
+	}
+}
+
+// --- the store-replacement mitigations ---------------------------------------
+//
+// A store's identity lives in its data directory, which on both these runtimes
+// is ephemeral. So a replaced task is a new, empty store at a new address, while
+// PD keeps the old record and every region that had a replica on it. Left alone
+// PD waits out max-store-down-time -- thirty minutes -- before rebuilding, which
+// is long enough for a rolling deployment to replace the next store, and the one
+// after that, until no region has a live replica left.
+//
+// pd.star closes that window by releasing the dead record itself. It is the most
+// destructive thing any of these scripts does, so the decisions behind it are
+// tested rather than reasoned about.
+
+func staleStoreEntry(t *testing.T, id int, addr, state string) starlark.Value {
+	t.Helper()
+	inner, outer := starlark.NewDict(3), starlark.NewDict(1)
+	for k, v := range map[string]starlark.Value{
+		"id": starlark.MakeInt(id), "address": starlark.String(addr), "state_name": starlark.String(state),
+	} {
+		if err := inner.SetKey(starlark.String(k), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := outer.SetKey(starlark.String("store"), inner); err != nil {
+		t.Fatal(err)
+	}
+	return outer
+}
+
+func stringList(ss ...string) *starlark.List {
+	vs := make([]starlark.Value, 0, len(ss))
+	for _, s := range ss {
+		vs = append(vs, starlark.String(s))
+	}
+	return starlark.NewList(vs)
+}
+
+// discovery_is_trustworthy stands between a throttled discovery call and
+// deleting a healthy cluster's metadata. Both edges matter: it must tolerate the
+// one store legitimately missing during a rolling replacement, and it must
+// refuse an answer that has collapsed.
+func TestE2ETiKVDiscoveryIsTrustworthy(t *testing.T) {
+	for _, path := range []string{
+		"e2e/tikv/aws/docker/tikv-pd/pd.star",
+		"e2e/tikv/gcp/docker/tikv-pd/pd.star",
+	} {
+		t.Run(strings.TrimPrefix(path, "e2e/tikv/"), func(t *testing.T) {
+			eng := loadE2ETiKVScript(t, path)
+			// MUSTER_TIKV_REPLICAS is unset here, so the script's own default of
+			// 3 applies -- the shape both stacks actually deploy.
+			for _, tc := range []struct {
+				live int
+				want bool
+				why  string
+			}{
+				{0, false, "discovery returned nothing at all"},
+				{1, false, "a collapsed answer, not a cluster with two dead stores"},
+				{2, true, "one store missing is a rolling replacement: the case this exists for"},
+				{3, true, "the whole tier"},
+			} {
+				v, err := eng.invokeValue(context.Background(), eng.globals["discovery_is_trustworthy"],
+					starlark.Tuple{starlark.MakeInt(tc.live)})
+				if err != nil {
+					t.Fatalf("discovery_is_trustworthy(%d): %v", tc.live, err)
+				}
+				if got := bool(v.Truth()); got != tc.want {
+					t.Errorf("discovery_is_trustworthy(%d) = %v, want %v: %s", tc.live, got, tc.want, tc.why)
+				}
+			}
+		})
+	}
+}
+
+// stale_store answers "which record should PD be told to let go of". Deleting
+// the wrong one costs replicas, so most of these are cases where the only
+// correct answer is "none of them".
+func TestE2ETiKVStaleStore(t *testing.T) {
+	eng := loadE2ETiKVScript(t, "e2e/tikv/aws/docker/tikv-pd/pd.star")
+	fn := eng.globals["stale_store"]
+
+	const a, b, c = "10.0.0.1:20160", "10.0.0.2:20160", "10.0.0.3:20160"
+	live := stringList(a, b, c)
+	healthy := []starlark.Value{
+		staleStoreEntry(t, 1, a, "Up"), staleStoreEntry(t, 2, b, "Up"), staleStoreEntry(t, 3, c, "Up"),
+	}
+
+	call := func(t *testing.T, stores ...starlark.Value) starlark.Value {
+		t.Helper()
+		v, err := eng.invokeValue(context.Background(), fn, starlark.Tuple{starlark.NewList(stores), live})
+		if err != nil {
+			t.Fatalf("stale_store: %v", err)
+		}
+		return v
+	}
+	addrOf := func(t *testing.T, v starlark.Value) string {
+		t.Helper()
+		d, ok := v.(*starlark.Dict)
+		if !ok {
+			t.Fatalf("got %v, want a store dict", v)
+		}
+		got, _, err := d.Get(starlark.String("address"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, _ := starlark.AsString(got)
+		return s
+	}
+
+	t.Run("healthy cluster keeps every record", func(t *testing.T) {
+		if v := call(t, healthy...); v != starlark.None {
+			t.Errorf("stale_store() = %v on a healthy cluster", v)
+		}
+	})
+
+	// The incident: the task was replaced, so its address left discovery and its
+	// data went with it, while PD kept the record.
+	t.Run("replaced store is stale", func(t *testing.T) {
+		v := call(t, append(append([]starlark.Value{}, healthy...),
+			staleStoreEntry(t, 4, "10.0.0.9:20160", "Disconnected"))...)
+		if got := addrOf(t, v); got != "10.0.0.9:20160" {
+			t.Errorf("stale_store() = %q, want the replaced store", got)
+		}
+	})
+
+	// A heartbeating store is answering for itself whatever discovery says.
+	// Discovery lags; a heartbeat does not.
+	t.Run("absent from discovery but heartbeating is not stale", func(t *testing.T) {
+		v := call(t, append(append([]starlark.Value{}, healthy...),
+			staleStoreEntry(t, 4, "10.0.0.9:20160", "Up"))...)
+		if v != starlark.None {
+			t.Errorf("stale_store() = %v for a store PD is still hearing from", v)
+		}
+	})
+
+	t.Run("already handled records are left alone", func(t *testing.T) {
+		for _, state := range []string{"Offline", "Tombstone"} {
+			v := call(t, append(append([]starlark.Value{}, healthy...),
+				staleStoreEntry(t, 4, "10.0.0.9:20160", state))...)
+			if v != starlark.None {
+				t.Errorf("stale_store() = %v for a %s store", v, state)
+			}
+		}
+	})
+
+	// One at a time, even when the whole tier has been replaced: the caller
+	// re-derives its evidence every pass, so a single bad discovery reading can
+	// cost one record rather than the cluster's entire metadata.
+	t.Run("a full roll yields one at a time", func(t *testing.T) {
+		v := call(t,
+			staleStoreEntry(t, 1, "10.0.0.7:20160", "Down"),
+			staleStoreEntry(t, 2, "10.0.0.8:20160", "Down"),
+			staleStoreEntry(t, 3, "10.0.0.9:20160", "Down"),
+			staleStoreEntry(t, 4, a, "Up"), staleStoreEntry(t, 5, b, "Up"), staleStoreEntry(t, 6, c, "Up"))
+		if got := addrOf(t, v); got != "10.0.0.7:20160" {
+			t.Errorf("stale_store() = %q, want the first dead store", got)
+		}
+	})
+}
+
+// seed_looks_abandoned decides whether to release the lease that makes exactly
+// one replica bootstrap. Releasing one held by a replica that is merely slow is
+// a split brain, so the decision must not even be reachable without consulting
+// discovery.
+func TestE2ETiKVSeedLooksAbandonedNeedsDiscovery(t *testing.T) {
+	eng := loadE2ETiKVScript(t, "e2e/tikv/aws/docker/tikv-pd/pd.star")
+
+	_, err := eng.invokeValue(context.Background(), eng.globals["seed_looks_abandoned"],
+		starlark.Tuple{starlark.String("10.0.0.9")})
+	if err == nil {
+		t.Fatal("seed_looks_abandoned answered with no discovery provider configured")
+	}
+	if !strings.Contains(err.Error(), "service discovery") {
+		t.Errorf("failed for the wrong reason: %v", err)
+	}
+}
+
+// The gate that was missing, and whose absence destroyed a healthy store.
+//
+// PD identifies a store by address. When a replacement lands on an address an
+// earlier store used, PD hands the new process that old record -- still Down,
+// because it has not heartbeated yet -- while discovery has not yet caught up
+// with the new task either. For a few seconds the record is indistinguishable
+// from an abandoned one, and releasing it in that window tombstones a store
+// that is running: the process is rejected from then on with StoreTombstone.
+//
+// A probe of the store's own status port cannot lag, which is why it is the
+// last gate before the delete.
+func TestE2ETiKVStoreOccupancyProbe(t *testing.T) {
+	for _, path := range []string{
+		"e2e/tikv/aws/docker/tikv-pd/pd.star",
+		"e2e/tikv/gcp/docker/tikv-pd/pd.star",
+	} {
+		t.Run(strings.TrimPrefix(path, "e2e/tikv/"), func(t *testing.T) {
+			eng := loadE2ETiKVScript(t, path)
+
+			// status_url prefers what the store advertised, and falls back to
+			// the service address's host when a deployment left it unset --
+			// probing 0.0.0.0 would answer about this process, not that one.
+			for _, tc := range []struct{ addr, status, want string }{
+				{"10.0.0.1:20160", "10.0.0.1:20180", "http://10.0.0.1:20180/status"},
+				{"10.0.0.1:20160", "0.0.0.0:20180", "http://10.0.0.1:20180/status"},
+				{"10.0.0.1:20160", "", "http://10.0.0.1:20180/status"},
+			} {
+				st := staleStoreEntry(t, 1, tc.addr, "Down")
+				inner, _, err := st.(*starlark.Dict).Get(starlark.String("store"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := inner.(*starlark.Dict).SetKey(
+					starlark.String("status_address"), starlark.String(tc.status)); err != nil {
+					t.Fatal(err)
+				}
+				v, err := eng.invokeValue(context.Background(), eng.globals["status_url"], starlark.Tuple{inner})
+				if err != nil {
+					t.Fatalf("status_url(%q): %v", tc.status, err)
+				}
+				if got, _ := starlark.AsString(v); got != tc.want {
+					t.Errorf("status_url(status_address=%q) = %q, want %q", tc.status, got, tc.want)
+				}
+			}
+
+			// 203.0.113.0/24 is TEST-NET-3: unroutable, so nothing answers and
+			// the address really is free.
+			st := staleStoreEntry(t, 1, "203.0.113.1:20160", "Down")
+			inner, _, err := st.(*starlark.Dict).Get(starlark.String("store"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := inner.(*starlark.Dict).SetKey(
+				starlark.String("status_address"), starlark.String("203.0.113.1:20180")); err != nil {
+				t.Fatal(err)
+			}
+			v, err := eng.invokeValue(context.Background(), eng.globals["store_is_occupied"], starlark.Tuple{inner})
+			if err != nil {
+				t.Fatalf("store_is_occupied: %v", err)
+			}
+			if bool(v.Truth()) {
+				t.Error("store_is_occupied said an unroutable address was occupied")
+			}
+		})
 	}
 }

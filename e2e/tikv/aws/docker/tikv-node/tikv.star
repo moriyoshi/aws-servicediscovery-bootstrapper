@@ -7,6 +7,9 @@
 # The fallback for me(), and optional now that SELF.ipv4 is the primary source.
 CIDR = env("MUSTER_SUBNET_CIDR")
 PD_SERVICE = env("MUSTER_PD_SERVICE", "tikv-pd")
+# This tier's own discovery name, so a store can ask which stores exist and
+# compare that with which stores PD still believes in.
+TIKV_SERVICE = env("MUSTER_TIKV_SERVICE", "tikv-node")
 PD_REPLICAS = int(env("MUSTER_PD_REPLICAS", "3"))
 
 DATA_DIR = env("MUSTER_DATA_DIR", "/db")
@@ -56,6 +59,23 @@ def resolve_tikv():
         fail("tikv: PD was not reachable within 240s")
 
     ip = me()
+
+    # Auto-heal the unrecoverable case. A tombstoned record cannot be revived,
+    # and the data directory behind it can never register again -- so this task
+    # is finished whatever it does next. Failing here rather than starting a
+    # store that PD will reject on every heartbeat exhausts max_retries in
+    # seconds and exits, which is the signal the orchestrator needs to replace
+    # the task with a clean volume at (usually) a different address. pd.star
+    # clears the tombstone, so the replacement is not refused in turn.
+    #
+    # Only ever true on a respawn: the first attempt has not registered yet, so
+    # PD has no record of us to have tombstoned.
+    stores = pd_stores()
+    if stores != None and store_state(stores, "%s:%d" % (ip, PORT)) == "Tombstone":
+        fail("tikv: PD has tombstoned the store at %s:%d. That record cannot be " % (ip, PORT) +
+             "revived and its data directory cannot be reused, so this task has to " +
+             "be replaced rather than restarted -- exiting to let that happen.")
+
     return COMMAND + [
         "--addr",
         "0.0.0.0:%d" % PORT,
@@ -72,8 +92,67 @@ def resolve_tikv():
     ]
 
 
+def pd_stores():
+    """PD's whole view of the store tier, or None if no PD answered.
+
+    Asks each PD in turn rather than only the first: this runs during startup and
+    during rolling replacements, which is exactly when some of them are not
+    listening yet.
+    """
+    for a in pd_addrs():
+        r = http_request("GET", "http://%s/pd/api/v1/stores" % a, timeout = "5s")
+        if r.status == 200:
+            return json.decode(r.body)["stores"]
+    return None
+
+
+def store_state(stores, addr):
+    """This store's state as PD sees it: Up, Offline, Down, Tombstone, or None
+    when PD has never heard of it."""
+    for s in stores:
+        if s["store"]["address"] == addr:
+            return s["store"]["state_name"]
+    return None
+
+
 def tikv_readiness():
-    return poll(http_ok(LOCAL_STATUS, "3s"), "30m", interval = "5s")
+    """Serving locally, and accepted into the cluster by PD.
+
+    The local status port alone was the original check, and it answers "my
+    process is up" -- true of a store PD has never heard of, and true of one
+    whose record PD has thrown away. Requiring PD to list this store Up is a much
+    narrower claim and the one a deployment should be gated on.
+
+    A hand-rolled loop rather than poll(), because there are three outcomes here
+    and poll() only distinguishes two: ready, not ready yet, and never going to
+    be. The third is worth exiting on immediately.
+    """
+    addr = "%s:%d" % (me(), PORT)
+
+    def watch():
+        for _ in range(360):  # thirty minutes at five seconds
+            if http_ok(LOCAL_STATUS, "3s")():
+                stores = pd_stores()
+                if stores != None:
+                    state = store_state(stores, addr)
+                    if state == "Up":
+                        return True
+                    if state == "Tombstone":
+                        # Terminal. A tombstoned record cannot be revived and the
+                        # data directory behind it can never be registered again,
+                        # so waiting out the rest of the window buys nothing and
+                        # costs the orchestrator's whole grace period on a store
+                        # that is never coming back. Returning False restarts the
+                        # workload, and resolve_tikv() then exits the task so a
+                        # clean one takes its place.
+                        log("tikv: PD has tombstoned this store's record; it can " +
+                            "never register again and needs a fresh task rather " +
+                            "than a restart", me = addr)
+                        return False
+            sleep("5s")
+        return False
+
+    return go(watch)
 
 
 def tikv_down():
@@ -104,8 +183,13 @@ def main():
         # lets ECS replace the task, rather than hanging as a healthy-looking
         # container forever.
         max_retries = 5,
-        # Unlike PD, a store has no membership to be evicted from and keeps its
-        # data directory across a restart, so restarting in place on a liveness
-        # loss (the spawn() default) is the cheapest way back.
+        # Unlike PD, a store has no membership to evict itself from, and a
+        # restart *in place* keeps the data directory, so that is the cheapest
+        # way back from a liveness loss (the spawn() default).
+        #
+        # Note the "in place". A replaced task is a different thing entirely:
+        # the volume is ephemeral, so the replacement comes up empty and
+        # registers with PD as a brand new store, while the old store's record
+        # and every region that lived on it remain. See stale_stores().
         shutdown_grace = "30s",
     )

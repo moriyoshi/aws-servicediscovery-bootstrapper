@@ -48,6 +48,23 @@ def resolve_tikv():
         fail("tikv: PD was not reachable within 300s")
 
     ip = me()
+
+    # Auto-heal the unrecoverable case. A tombstoned record cannot be revived,
+    # and the data directory behind it can never register again -- so this task
+    # is finished whatever it does next. Failing here rather than starting a
+    # store that PD will reject on every heartbeat exhausts max_retries in
+    # seconds and exits, which is the signal the orchestrator needs to replace
+    # the task with a clean volume at (usually) a different address. pd.star
+    # clears the tombstone, so the replacement is not refused in turn.
+    #
+    # Only ever true on a respawn: the first attempt has not registered yet, so
+    # PD has no record of us to have tombstoned.
+    stores = pd_stores()
+    if stores != None and store_state(stores, "%s:%d" % (ip, PORT)) == "Tombstone":
+        fail("tikv: PD has tombstoned the store at %s:%d. That record cannot be " % (ip, PORT) +
+             "revived and its data directory cannot be reused, so this task has to " +
+             "be replaced rather than restarted -- exiting to let that happen.")
+
     return COMMAND + [
         "--addr",
         "0.0.0.0:%d" % PORT,
@@ -68,15 +85,63 @@ def tikv_registered():
     register(TIKV_SERVICE, port = PORT)
 
 
-def tikv_readiness():
-    """Serving locally, and discoverable. See pd.star for why discovery is part
-    of readiness rather than left to a best-effort post_start."""
-    def ready():
-        if not http_ok(LOCAL_STATUS, "3s")():
-            return False
-        return SELF.ipv4 in [i.ipv4 for i in instances(TIKV_SERVICE, health_status = "ALL")]
+def pd_stores():
+    """PD's whole view of the store tier, or None if no PD answered."""
+    for a in pd_addrs():
+        r = http_request("GET", "http://%s/pd/api/v1/stores" % a, timeout = "5s")
+        if r.status == 200:
+            return json.decode(r.body)["stores"]
+    return None
 
-    return poll(ready, "10m", interval = "5s")
+
+def store_state(stores, addr):
+    """This store's state as PD sees it: Up, Offline, Down, Tombstone, or None
+    when PD has never heard of it."""
+    for s in stores:
+        if s["store"]["address"] == addr:
+            return s["store"]["state_name"]
+    return None
+
+
+def tikv_readiness():
+    """Serving locally, discoverable, and accepted into the cluster by PD.
+
+    Discovery is part of readiness for the reason pd.star gives: nothing on Cloud
+    Run registers an instance, so an unregistered store is invisible to
+    everything that depends on it. PD registration is the newer half -- serving
+    locally answers "my process is up", which is true of a store PD has never
+    heard of and of one whose record PD has thrown away.
+
+    A hand-rolled loop rather than poll(), because there are three outcomes and
+    poll() only distinguishes two: ready, not ready yet, and never going to be.
+    """
+    addr = "%s:%d" % (SELF.ipv4, PORT)
+
+    def watch():
+        for _ in range(120):  # ten minutes at five seconds
+            if http_ok(LOCAL_STATUS, "3s")() and \
+               SELF.ipv4 in [i.ipv4 for i in instances(TIKV_SERVICE, health_status = "ALL")]:
+                stores = pd_stores()
+                if stores != None:
+                    state = store_state(stores, addr)
+                    if state == "Up":
+                        return True
+                    if state == "Tombstone":
+                        # Terminal. A tombstoned record cannot be revived and the
+                        # data directory behind it can never be registered again,
+                        # so waiting out the rest of the window buys nothing and
+                        # costs the orchestrator's whole grace period on a store
+                        # that is never coming back. Returning False restarts the
+                        # workload, and resolve_tikv() then exits the task so a
+                        # clean one takes its place.
+                        log("tikv: PD has tombstoned this store's record; it can " +
+                            "never register again and needs a fresh task rather " +
+                            "than a restart", me = addr)
+                        return False
+            sleep("5s")
+        return False
+
+    return go(watch)
 
 
 def tikv_down():
