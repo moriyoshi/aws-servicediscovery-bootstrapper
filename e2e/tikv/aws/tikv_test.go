@@ -421,6 +421,143 @@ func TestTiKVOnFargate(t *testing.T) {
 			}
 		}
 	})
+
+	// Replacing a *store* is a harder problem than replacing a PD, and the one
+	// that bit for real.
+	//
+	// A store's identity lives in its data directory, which on Fargate is
+	// ephemeral. So the replacement is not the same store returning: it is a new,
+	// empty one at a new address, and PD keeps the old record along with every
+	// region that had a replica on it. PD does recover on its own -- after
+	// max-store-down-time, thirty minutes by default -- which is long enough for
+	// a rolling deployment to replace the next store, and the one after that,
+	// until no region has a live replica left. That is unrecoverable, and it
+	// happens with every process running and every health check green.
+	//
+	// pd.star closes the window by releasing the dead record itself. This asserts
+	// that it does: PD's store list must come back to exactly the addresses that
+	// exist, with the regions replicated across them again.
+	t.Run("StoreReplacementIsReaped", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("-short: skipping the store replacement check")
+		}
+		ctx := context.Background()
+
+		tasks, err := s.listTasks(ctx, s.tikvService)
+		if err != nil {
+			t.Fatalf("list TiKV tasks: %v", err)
+		}
+		if len(tasks) == 0 {
+			t.Fatal("no TiKV tasks to stop")
+		}
+		victim := tasks[0]
+		victimIP := taskIP(victim)
+		victimAddr := victimIP + ":20160"
+		victimARN := aws.ToString(victim.TaskArn)
+		t.Logf("stopping TiKV task %s (%s)", taskID(victim), victimAddr)
+
+		if _, err := s.ecs.StopTask(ctx, &ecs.StopTaskInput{
+			Cluster: aws.String(s.cluster),
+			Task:    aws.String(victimARN),
+			Reason:  aws.String("muster e2e: store replacement check"),
+		}); err != nil {
+			t.Fatalf("stop task: %v", err)
+		}
+
+		harness.Eventually(t, "TiKV service back to steady state without "+taskID(victim), 20*time.Minute, 15*time.Second,
+			func(ctx context.Context) error {
+				tasks, err := s.listTasks(ctx, s.tikvService)
+				if err != nil {
+					return err
+				}
+				for _, task := range tasks {
+					if aws.ToString(task.TaskArn) == victimARN {
+						return fmt.Errorf("task %s is still %s", taskID(task), aws.ToString(task.LastStatus))
+					}
+				}
+				if err := s.serviceSteady(ctx, s.tikvService, s.tikvCount); err != nil {
+					return err
+				}
+				return s.tasksHealthy(ctx, s.tikvService, s.tikvCount)
+			})
+
+		// The heart of it. Without the reconciliation loop the dead record sits
+		// in PD for max-store-down-time, so this window is deliberately shorter
+		// than that: if it passes, something released the record early, and the
+		// only thing that does is pd.star.
+		harness.Eventually(t, "PD's store list matches the stores that exist", 15*time.Minute, 15*time.Second,
+			func(ctx context.Context) error {
+				instances, err := s.discover(ctx, s.tikvDiscover)
+				if err != nil {
+					return err
+				}
+				var want []string
+				for _, ip := range instanceIPs(instances) {
+					want = append(want, ip+":20160")
+				}
+				if len(want) != s.tikvCount {
+					return fmt.Errorf("%d stores registered in CloudMap, want %d", len(want), s.tikvCount)
+				}
+
+				var stores pdStores
+				if err := s.pdGet(ctx, "/pd/api/v1/stores", &stores); err != nil {
+					return err
+				}
+				var known []string
+				for _, entry := range stores.Stores {
+					// Tombstones are records PD has finished with; they are the
+					// end state of a successful release, not a leftover.
+					if entry.Store.StateName == "Tombstone" {
+						continue
+					}
+					if entry.Store.StateName != "Up" {
+						return fmt.Errorf("store %d (%s) is %s",
+							entry.Store.ID, entry.Store.Address, entry.Store.StateName)
+					}
+					known = append(known, entry.Store.Address)
+				}
+				if contains(known, victimAddr) {
+					return fmt.Errorf("PD still lists the replaced store %s", victimAddr)
+				}
+				if !sameSet(known, want) {
+					return fmt.Errorf("PD knows stores at %v, running tasks are at %v", sorted(known), sorted(want))
+				}
+				return nil
+			})
+
+		// Releasing the record is only half of it; PD has to have rebuilt the
+		// replicas that lived on the dead store onto the replacement. Until it
+		// has, every region is one replica short and a second replacement would
+		// cost quorum.
+		harness.Eventually(t, "regions replicated again after the replacement", 15*time.Minute, 15*time.Second,
+			func(ctx context.Context) error {
+				var info pdClusterInfo
+				if err := s.pdGet(ctx, "/pd/api/v1/cluster", &info); err != nil {
+					return err
+				}
+				replicas := info.MaxPeerCount
+				if replicas == 0 {
+					replicas = 3
+				}
+
+				var regions pdRegions
+				if err := s.pdGet(ctx, "/pd/api/v1/regions", &regions); err != nil {
+					return err
+				}
+				if regions.Count == 0 {
+					return errors.New("PD knows no regions")
+				}
+				for _, r := range regions.Regions {
+					if len(r.Peers) != replicas {
+						return fmt.Errorf("region %d has %d peers, want %d", r.ID, len(r.Peers), replicas)
+					}
+					if r.Leader.StoreID == 0 {
+						return fmt.Errorf("region %d has no leader", r.ID)
+					}
+				}
+				return nil
+			})
+	})
 }
 
 // --- small helpers ---------------------------------------------------------

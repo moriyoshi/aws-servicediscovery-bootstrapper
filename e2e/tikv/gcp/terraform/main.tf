@@ -207,6 +207,9 @@ locals {
     MUSTER_PD_SERVICE   = local.pd_discovery_name
     MUSTER_TIKV_SERVICE = local.tikv_discovery_name
     MUSTER_PD_REPLICAS  = tostring(var.pd_instance_count)
+    # pd.star will not act on a discovery answer that does not account for a
+    # majority of this many stores.
+    MUSTER_TIKV_REPLICAS = tostring(var.tikv_instance_count)
   }
 }
 

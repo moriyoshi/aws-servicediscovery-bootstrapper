@@ -240,6 +240,41 @@ def main():
 	}
 }
 
+// Scripts decide things from what an API answered, not merely from whether it
+// answered: whether this replica is registered with the coordinator, whether
+// the coordinator still believes in a peer that no longer exists. Without a
+// parser the only tool is a substring match against raw JSON, which passes for
+// the wrong reasons -- `"state_name":"Up"` is `in` a body describing a cluster
+// where one store is Up and two are Down.
+func TestJSONBuiltin(t *testing.T) {
+	const stores = `{"count":2,"stores":[` +
+		`{"store":{"address":"10.0.0.1:20160","state_name":"Up"}},` +
+		`{"store":{"address":"10.0.0.2:20160","state_name":"Down"}}]}`
+
+	// Single-quoted on the Starlark side: the body is JSON, so it is full of
+	// double quotes and contains no single ones.
+	v := joinValue(t, mustMain(t, `
+BODY = '`+stores+`'
+
+def main():
+    def body():
+        d = json.decode(BODY)
+        down = [s["store"]["address"] for s in d["stores"] if s["store"]["state_name"] != "Up"]
+        return ",".join(down) + "/" + str(d["count"])
+    return go(body)
+`, nil))
+	if s, _ := starlark.AsString(v); s != "10.0.0.2:20160/2" {
+		t.Fatalf("got %v, want the one down store and the count", v)
+	}
+
+	// encode and indent come with the module and are worth pinning: a script
+	// that logs a decision wants to log the thing it decided from.
+	v = joinValue(t, mustMain(t, `def main(): return go(lambda: json.encode({"a": [1, 2]}))`, nil))
+	if s, _ := starlark.AsString(v); s != `{"a":[1,2]}` {
+		t.Fatalf("json.encode gave %v", v)
+	}
+}
+
 func TestProbeFactory(t *testing.T) {
 	// *_ok returns a callable factory; calling it runs the probe. A bad address
 	// yields False; un() negates it to True — all lambda-free.

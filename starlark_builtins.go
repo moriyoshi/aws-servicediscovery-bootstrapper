@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"time"
 
+	starlarkjson "go.starlark.net/lib/json"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
 
@@ -125,6 +126,21 @@ func buildPredeclared(deps *engineDeps) starlark.StringDict {
 		"SELF":     selfToStarlark(deps.self),
 		"PROVIDER": starlark.String(deps.provider),
 		"COMMAND":  stringsToStarlark(deps.command),
+
+		// json.decode / json.encode / json.indent, from starlark-go's own
+		// library rather than hand-rolled.
+		//
+		// Without this a script can only substring-match an HTTP response body,
+		// which is enough to ask "did this answer at all" and nothing more. Any
+		// decision that depends on *what* an API said -- is this replica
+		// registered, does the coordinator still believe in a peer that no
+		// longer exists -- needs the body parsed, and doing that with `in`
+		// against raw JSON is the kind of check that passes for the wrong
+		// reason.
+		//
+		// Pure and side-effect free, so it adds nothing to a script's reach:
+		// http_request() already decides what a script may talk to.
+		"json": starlarkjson.Module,
 	}
 
 	env["instances"] = b("instances", func(t *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {

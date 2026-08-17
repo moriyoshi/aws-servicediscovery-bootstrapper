@@ -732,3 +732,296 @@ hypothesis — each cost a full provision, and each would have cost minutes if i
 had been able to say "this is not the shape I expected". Silence is the
 expensive failure mode here, which is also why muster now reports a task
 rejection nobody joined.
+
+## 2026-08-13 – 15 — Store replacement on ephemeral storage
+
+Not planned work. A throwaway benchmark harness — `bench/`, untracked, outside
+everything here — was built to ask how a muster-run TiKV cluster performs next
+to the managed key/value service on each cloud. It turned out to be a good
+detector for a fault in the deployment muster produces, and this section is
+about that fault rather than about the numbers.
+
+Everything below is now in `e2e/tikv/*` and covered by tests. Neither suite has
+been run against it yet.
+
+### The fault
+
+A TiKV store's identity lives in its data directory. On Fargate and on Cloud
+Run that directory is ephemeral, so **a replaced task is not a restarted store**:
+it is a new, empty one, with a new store id at a new address. PD keeps the old
+record and every region that had a replica on it.
+
+With three stores and PD's default `max-replicas` of 3 the arithmetic is
+unforgiving. Replacing one store leaves each region at 2/3 and survives.
+Replacing two loses quorum. Replacing three is permanent loss. A `terraform
+apply` that changes the store task definition rolls all three in about two
+minutes, and nothing in either platform knows that is destructive.
+
+Two asymmetries turn a degradation into a brick:
+
+- **PD survives what the stores do not.** PD is a Raft group replaced one task
+  at a time, so each new member rejoins and syncs from the survivors. Its
+  metadata is immortal across rolls while the stores' data survives none of
+  them. Restarting the cluster is therefore the operation that *creates* the bad
+  state — a PD confidently serving region locations for stores that died two
+  generations ago.
+- **Every health signal said fine.** All six tasks reported HEALTHY throughout,
+  because the probe answered "is my process up and serving" and every process
+  was. The cluster could not serve a single region and the deployment completed
+  successfully.
+
+### How it was diagnosed, which is the transferable part
+
+The presenting symptom was "the benchmark says TiKV is slow", then "TiKV stopped
+working". The client log was thousands of `DeadlineExceeded` health checks and
+prewrites retrying twenty-four times.
+
+What settled it, in order:
+
+- **The stores were idle.** CloudWatch put the tier at **2.7% CPU** against 87.6%
+  memory. Overload was the obvious hypothesis and it was wrong: the stores were
+  not thrashing, they were doing nothing, because they owned nothing.
+- **The addresses did not exist.** The client was retrying `.28`, `.81`, `.181`;
+  the live tasks were `.6`, `.13`, `.153`, and CloudMap agreed with the live
+  ones. The three the client had came from PD.
+- **They were two generations old.** `describe-tasks` on the stopped tasks put
+  `.28`/`.81`/`.181` at a roll forty minutes earlier — not even the roll that
+  had just happened.
+
+The `tikv_memory` change that preceded the failure was a red herring: memory sat
+at 87.6% both before and after, because TiKV sizes its caches to the cgroup
+limit whatever it is given.
+
+### Findings
+
+**A store record's state is not a stale reading.** PD reports a vanished store
+as `Disconnected` within about ninety seconds — `state_name` is a derived
+display state covering Disconnected and Down, not only the administrative
+Up/Offline/Tombstone. This was expected to need heartbeat-age arithmetic and
+does not, which is what makes a cheap check possible.
+
+**PD refuses to release a record below `max-replicas`, and says so.**
+
+    DELETE /pd/api/v1/store/1
+      → 400  [PD:core:ErrStoresNotEnough] can not remove store 1 since the
+             number of up stores would be 0 while need 3
+
+On a cluster running the minimum three stores for three replicas that refusal is
+*routine*: the dead record cannot be released until the replacement registers
+and brings the up count back to three. Verified against a real PD rather than
+assumed, and it changed the design — the reconciliation loop treats this as the
+expected path and says so plainly, or every normal replacement would log like a
+fault. It also means the fix narrows the window rather than closing it, and it
+is the strongest argument for running more stores than replicas: with four,
+releasing a dead record leaves three up and PD allows it immediately.
+
+**Readiness is evaluated once, which decides where a check may live.**
+`watchReadiness` awaits its promise a single time: truthy latches healthy, false
+restarts the workload, and past the health-check grace period the scheduler
+replaces the task — which mints another dead store record. So a store's
+readiness must not gate on *other* stores being stale; that turns one stale
+store into a loop that manufactures more. The hard gate belongs in a client,
+where a false positive costs nothing. This is the shape of the whole mitigation:
+detect in the cluster, refuse outside it.
+
+**Requiring the whole tier to be visible is a guard that never fires.** The
+first version of the reconciliation guard demanded that discovery account for
+every expected store before acting. It reads as the cautious choice and is
+useless — during a rolling replacement exactly one store is legitimately
+missing, which is precisely when there is a dead record to release. It is a
+strict majority now (`n * 2 > expected`), extracted into
+`discovery_is_trustworthy()` so both edges are pinned by a test.
+
+**The reconciliation loop destroyed a healthy store, and the fix is a probe
+rather than a better guess.** Found on the first real cluster to run it, and the
+most important entry here.
+
+PD identifies a store by its *address*. When a replacement task lands on an
+address some earlier store used — routine in a small subnet — PD hands the new
+process that old record, which is still `Down` because it has not heartbeated
+yet. Discovery has not caught up with the new task either, because registration
+lags process start by seconds. For that window the record is indistinguishable
+from an abandoned one, and the loop released it:
+
+    10:44:53  task starts at 172.31.253.87, empty disk, adopts store 1032
+    10:45:01  prune sees 1032 @ .87 Down and .87 absent from CloudMap → deletes
+    10:45:13  [ERROR] store heartbeat failed: StoreTombstone("store is tombstone")
+
+Eight seconds. The store ran for the next twenty minutes, healthy by every ECS
+signal, rejected by PD on every heartbeat, owning nothing. The majority guard
+passed exactly as designed — two of three visible tolerates one missing during a
+replacement — because the missing one had not gone anywhere, it had just
+started.
+
+This is worse than the problem it was written for. A stale record degrades
+gracefully and PD recovers in thirty minutes; the loop *permanently* killed a
+running store in eight seconds.
+
+The fix is not a longer timer or a stricter majority; both are still guesses
+about a race. It is a signal that cannot lag: **probe the store's own status
+port before releasing its record.** Either something is listening at that
+address or nothing is, and that answer is available immediately. Discovery
+absence and PD's own state remain, but the probe is the last gate.
+
+The second half is `reap_tombstones`. PD refuses to register a store at an
+address a tombstone still holds, so on a platform that recycles addresses a
+leftover tombstone eventually rejects a perfectly good replacement — which is
+also why the store above could not simply be restarted into place. Clearing
+them is a single call and was originally dismissed as cosmetic; it is not.
+
+The general lesson is the one this project keeps paying for: a check that acts
+on the *absence* of evidence needs a positive signal before it acts. Discovery
+saying nothing and PD saying nothing are both absences, and two absences do not
+add up to a fact.
+
+**What can and cannot be healed without a human.** Three cases, and the third
+is the interesting one.
+
+*A store whose record was thrown away* now heals itself. Readiness distinguishes
+three outcomes rather than two — ready, not yet, and never going to be — and
+returns false immediately on `Tombstone` instead of polling out a
+thirty-minute window. `resolve_tikv()` then refuses to start a store PD would
+reject on every heartbeat, which exhausts `max_retries` in seconds and exits, and
+the orchestrator replaces the task with a clean volume. `reap_tombstones` clears
+the record so the replacement is not refused at the same address in turn. What
+used to be a store sitting healthy-looking and useless until the grace period
+expired is now a task replacement inside a minute.
+
+*A stale record* heals itself, with the occupancy probe as the gate.
+
+*A cluster whose data is entirely on stores that no longer exist* does not, and
+`cluster_lost_its_data()` reports it rather than acting. Recovery means
+`pd-ctl unsafe remove-failed-stores`, which discards whatever those regions
+held; that is a policy decision, not a repair. Automating it would be a script
+throwing data away on its own judgement — and that judgement is exactly the one
+this loop has already been wrong about once. Detection is cheap and the log line
+names the remedy, which is the right amount of help.
+
+**The seed lease outlives the cluster.** It lives in DynamoDB or GCS, neither
+ephemeral. After a full restart a new PD reads a lease naming a replica that no
+longer exists and waits five minutes on it before failing. `await_seed()` now
+releases such a lease — but only after that full five minutes of silence, only
+when the seed is absent from a discovery answer large enough to be believed, and
+then conditionally on the exact value it judged. Getting this wrong is a split
+brain: releasing a lease held by a replica that is merely slow lets a second
+replica bootstrap a second cluster. The delete is the cheap part; the evidence
+is the point.
+
+**PD's timestamp oracle is the highest-leverage knob in the deployment.** A
+separate finding from the same benchmark, and measured rather than argued: PD at
+half a vCPU produced 2989 `get timestamp too slow` warnings (mean 38.9 ms, max
+81 ms) and a read p99 of 28.8 ms on a workload that touches no disk. At one vCPU
+the warnings went to **zero** and the p99 to 1.9 ms — a fifteenfold improvement
+in the tail from half a vCPU. Every TiKV transaction, read or write, fetches a
+timestamp from the PD leader first, and that path is CPU-bound. What made it
+findable was that the tail was *implausible*: 20 MB of data, entirely in block
+cache, cannot produce a 29 ms read p99, so storage did not explain it and
+something else had to. The stores never complained once in either run — reading
+the client's own warnings rather than only the benchmark's summaries is what
+separated PD from TiKV.
+
+### What changed
+
+In muster:
+
+- **`json.decode` / `json.encode` / `json.indent`**, from starlark-go's own
+  module. Scripts could previously only substring-match an HTTP body, which
+  answers "did this reply" and nothing more. Every mitigation here depends on
+  deciding from *what* an API said. `'"state_name":"Up"' in body` is true of a
+  healthy cluster and of one where a single store is up and the rest are down —
+  and that exact mistake was then made in the benchmark's shell preflight, which
+  matched `"state_name":"..."` against a body PD pretty-prints with a space and
+  cheerfully reported no stores down.
+
+In `e2e/tikv/*`, both clouds:
+
+- **Readiness means PD has accepted this store**, not that a local port answers.
+  Staleness is reported loudly and deliberately not gated on; see above.
+- **`pd.star` reconciles PD's store list with the stores that exist** — the same
+  move `drop_member()` already makes one tier up for PD's own membership. On the
+  leader, once a minute, it takes offline the first store PD believes in whose
+  address is absent from discovery and which PD is no longer hearing from. The
+  signal is discovery, not PD's own view: a task that restarts *in place* keeps
+  its registration, so absence means the task is gone and the data with it —
+  *and* nothing may be answering at the store's own status port, which is the
+  gate that stops a just-started replacement from being mistaken for a corpse.
+  One store per pass, so a single bad reading costs one record rather than all
+  of them. Tombstones are cleared as they appear, or a recycled address stays
+  poisoned. `store delete`, which marks a store Offline and removes each peer only
+  after building a replacement — a region with no surviving replica keeps the
+  store Offline forever, which is the honest outcome and the signal that
+  `pd-ctl unsafe remove-failed-stores` and a human are required.
+- **One task at a time.** ECS defaults to `minimumHealthyPercent 100` /
+  `maximumPercent 200`, which for a three-task service permits three
+  replacements at once. Both services now cap the ceiling at desired + 1,
+  computed rather than hard-coded (`ceil((n+1)/n * 100)`: 134% at three tasks,
+  125% at four). Cloud Run worker pools have no equivalent — checked against the
+  provider schema, which offers `scaling` and `instance_splits` and nothing
+  resembling `max_surge`. Documented rather than solved.
+- **`StoreReplacementIsReaped`** on both suites, the tier below
+  `PDReplacementRejoins`. AWS stops a store task; GCP scales the pool down and
+  back up, for the reason that test documents at length. Both then assert PD's
+  store list returns to exactly the addresses that exist, all Up, with the
+  replaced address gone; AWS also asserts regions are back to full replication.
+  The convergence window is fifteen minutes, deliberately shorter than
+  `max-store-down-time`'s thirty — without the reconciliation loop the record
+  simply sits there and the test times out, so it cannot pass for the wrong
+  reason.
+
+### Verified
+
+- `go vet ./...`, `go test ./...`, `go vet` under both e2e build tags,
+  `terraform validate` and `fmt` on both roots.
+- All four scripts compile against the real muster binary.
+- The decisions behind the reconciliation loop — `stale_store`,
+  `discovery_is_trustworthy`, `seed_looks_abandoned` — are unit-tested in
+  `e2e_scripts_test.go`, and most cases assert that the answer is "leave it
+  alone". `seed_looks_abandoned` is asserted to *raise* without a discovery
+  provider, because a decision of that weight must not be reachable without
+  consulting discovery.
+- `TestE2EScriptsLoad` gained every new function name, which is what catches a
+  rename before a provision does.
+- PD's API shapes — `/pd/api/v1/stores`, the `state_name` transition, the
+  `store delete` refusal, the absence of a `no-leader` region filter — checked
+  against a real PD on the laptop, not against documentation.
+
+### Not verified
+
+**Neither suite has been run since any of this landed.** These changes make
+readiness strictly harder to satisfy and add a loop that deletes cluster
+metadata; that is exactly the sort of thing that passes review and fails on real
+infrastructure. Expect the first run to be slower, too: one-at-a-time
+replacement serialises what previously happened in parallel, and
+`wait_for_steady_state` now waits for it.
+
+The reconciliation loop *has* now run against a real cluster, which is how the
+tombstone bug above was found — but it has not run since that fix. What the
+first run proved is that the loop fires, finds the right records and calls the
+right endpoint; what it also proved is that "finds the right records" was wrong
+in a way no unit test would have caught, because the failure is a race between
+two systems' notions of when a task exists.
+
+### If you pick this up next
+
+Run both suites. That is the whole of it — nothing else here is blocked.
+
+After that, in order of value:
+
+- **Run more stores than replicas.** Four against `max-replicas` 3 removes the
+  no-headroom case entirely and lets PD release a dead record immediately. It
+  costs one task. The e2e stacks stay at three because that is the minimum that
+  exercises replication and both clouds have to stay the same shape, but no
+  deployment holding data anyone cares about should be at the minimum.
+- **A cold-restart rule, enforced rather than documented.** A restart of this
+  cluster has to take *all* PD down at once, or PD returns remembering a cluster
+  whose data is gone. Nothing prevents the rolling version today.
+- **Stable storage where it actually matters.** None of this makes ephemeral
+  storage safe for a store; it makes loss survivable, visible and recoverable,
+  and shortens the window in which a second replacement turns a survivable loss
+  into an unrecoverable one from thirty minutes to about one. A store that must
+  survive replacement needs a runtime that preserves both its identity and its
+  disk — ECS on EC2 with EBS, EKS with PVCs, or the stateful MIGs the original
+  design identified as the only GCP runtime offering a preserved disk *and* a
+  preserved name. That boundary is worth stating plainly, because muster's whole
+  proposition invites running stateful workloads on runtimes that do not really
+  support them.

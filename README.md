@@ -358,6 +358,8 @@ Every promise has `p.done()`. **Cancellable** promises (`go`/`poll`) add `p.canc
 - `un(fn, *args)` → a check factory computing `not fn(*args)`. Negates a probe without a lambda: `poll(un(http_ok(url, "2s")), "24h")` resolves when the target stops being live.
 - `http_request(method, url, body=None, headers={}, timeout=30s)` → `{status, body}` (e.g. a PD member delete via HTTP `DELETE`).
 
+**JSON**: `json.decode(str)`, `json.encode(value)`, `json.indent(str, prefix="", indent="\t")` — starlark-go's own module. Pair it with `http_request` when a decision depends on *what* an API said rather than merely whether it answered: `json.decode(r.body)["stores"]`. Substring-matching a response body is the alternative and it passes for the wrong reasons — `'"state_name":"Up"' in body` is true of a healthy cluster and of one where a single store is up and the rest are down.
+
 **Key/value store** — see [below](#keyvalue-store).
 
 **Misc**: `env(name, default=None)` → str (reads the harness's own environment), `log(msg, **kwargs)`, `sleep(seconds)` (cancellable), `rand()` → float `[0.0, 1.0)`, `randint(a, b)` (inclusive, like `random.randint`), and `run([...])` → `{code, stdout, stderr}` (only with `-allow-run`).

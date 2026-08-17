@@ -28,6 +28,22 @@ resource "aws_ecs_cluster" "main" {
 }
 
 locals {
+  # Replace one task at a time, never two.
+  #
+  # ECS defaults to minimumHealthyPercent 100 / maximumPercent 200, which for a
+  # three-task service means it may start three replacements and stop three
+  # originals at once. For the store tier that is total data loss -- the volumes
+  # are ephemeral, so every replacement is a new, empty store -- and for PD it
+  # is the loss of Raft quorum.
+  #
+  # Sized so the ceiling is desired + 1: ECS allows floor(desired * pct / 100)
+  # tasks, so 4/3 rounded up gives 134% for three tasks and 125% for four. With
+  # minimumHealthyPercent at 100 the sequence is forced to be start one, wait
+  # for it to be healthy, stop one, repeat -- and "healthy" now means PD has
+  # accepted the store into the cluster, not merely that a port answers.
+  pd_one_at_a_time_pct   = ceil((var.pd_desired_count + 1) / var.pd_desired_count * 100)
+  tikv_one_at_a_time_pct = ceil((var.tikv_desired_count + 1) / var.tikv_desired_count * 100)
+
   control_socket = "/tmp/muster.sock"
 
   # `muster -health-probe` reports the container healthy only once every
@@ -79,6 +95,11 @@ locals {
     { name = "MUSTER_SUBNET_CIDR", value = var.internal_subnet_cidr },
     { name = "MUSTER_PD_SERVICE", value = local.pd_discovery_name },
     { name = "MUSTER_PD_REPLICAS", value = tostring(var.pd_desired_count) },
+    # tikv.star compares the stores PD believes in against the stores that
+    # exist; pd.star will not act on a discovery answer that does not account
+    # for a majority of this many.
+    { name = "MUSTER_TIKV_SERVICE", value = local.tikv_discovery_name },
+    { name = "MUSTER_TIKV_REPLICAS", value = tostring(var.tikv_desired_count) },
     { name = "MUSTER_SELF_GROUP", value = aws_ecs_cluster.main.name },
   ]
 }
@@ -157,6 +178,10 @@ resource "aws_ecs_service" "tikv_pd" {
   enable_execute_command            = true
   wait_for_steady_state             = var.wait_for_steady_state
   health_check_grace_period_seconds = local.health_check_grace_period
+
+  # See locals: one at a time.
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = local.pd_one_at_a_time_pct
 
   network_configuration {
     subnets          = [aws_subnet.internal.id]
@@ -280,6 +305,10 @@ resource "aws_ecs_service" "tikv_node" {
   enable_execute_command            = true
   wait_for_steady_state             = var.wait_for_steady_state
   health_check_grace_period_seconds = local.health_check_grace_period
+
+  # See locals: one at a time.
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = local.tikv_one_at_a_time_pct
 
   network_configuration {
     subnets          = [aws_subnet.internal.id]
